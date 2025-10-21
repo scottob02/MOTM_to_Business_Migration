@@ -1,0 +1,549 @@
+#!/bin/zsh
+
+#
+# ─── SCRIPT CONFIGURATION ─────────────────────────────────────────────────────
+#
+
+# --- Deferral Settings ---
+MAX_DEFERRALS=5
+PLIST_PATH="/Library/Application Support/LBG/com.lbg.jamf-migration.plist"
+LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
+LAUNCH_AGENT_PATH="/Users/$LOGGED_IN_USER/Library/LaunchAgents/com.lbg.jamf-migration.plist"
+
+
+# --- SwiftDialog Settings ---
+DIALOG_BINARY="/usr/local/bin/dialog"
+# This should point to the icon in your local branding package
+BRANDING_ICON="/Users/Shared/LBG_Branding_Cancara/lbg_primary_logo.png" 
+
+# --- Jamf API Credentials & Endpoints ---
+JAMF_CLIENT_ID="${4:-$JAMF_CLIENT_ID}"
+JAMF_CLIENT_SECRET="${5:-$JAMF_CLIENT_SECRET}"
+ORIGIN_JAMF_URL="${6:-$ORIGIN_JAMF_URL}"
+TARGET_JAMF_URL="${7:-$TARGET_JAMF_URL}"
+DRY_RUN="${8:-${DRY_RUN:-false}}"
+
+#
+# ─── LOGGING AND UTILITIES ────────────────────────────────────────────────────
+#
+
+LOG_FILE="/Users/$LOGGED_IN_USER/jamf_migration_preflight.log"
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
+
+log() {
+  printf '%b[%s] [INFO]  %s%b\n' \
+    "$YELLOW" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" | tee -a "$LOG_FILE"
+}
+
+success() {
+  printf '%b[%s] [SUCCESS] %s%b\n' \
+    "$GREEN" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" | tee -a "$LOG_FILE"
+}
+
+err() {
+  printf '%b[%s] [ERROR] %s%b\n' \
+    "$RED" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" | tee -a "$LOG_FILE" >&2
+  show_dialog_error "$1"
+  exit 1
+}
+
+run_cmd() {
+  if $dry_run && [[ "$1" == "kill" ]]; then
+    log "[DRY-RUN] Would execute: $*"
+  else
+    "$@"
+  fi
+}
+
+urlencode() {
+    local string="${1}"
+    local strlen=${#string}
+    local encoded=""
+    local pos c o
+
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+        c=${string:$pos:1}
+        case "$c" in
+            [-_.~a-zA-Z0-9] ) o="${c}" ;;
+            * )               printf -v o '%%%02x' "'$c"
+        esac
+        encoded+="${o}"
+    done
+    echo "${encoded}"
+}
+
+
+#
+# ─── SWIFTDIALOG FUNCTIONS ────────────────────────────────────────────────────
+#
+
+show_dialog_error() {
+  "$DIALOG_BINARY" --title "Migration Error" --message "$1" --icon "SF=xmark.octagon.fill,colour=red" \
+    --button1text "Close" --width 450 --height 250 --messagefont "size=12"
+}
+
+show_dialog_info() {
+    "$DIALOG_BINARY" --title "$1" --message "$2" --icon "$BRANDING_ICON" \
+      --button1text "OK" --width 450 --height 250 --messagefont "size=12"
+}
+
+show_dialog_confirm() {
+    "$DIALOG_BINARY" --title "$1" --message "$2" --icon "$BRANDING_ICON" \
+      --button1text "${3:-Proceed}" --button2text "${4:-Cancel}" --width 550 --height 350 --messagefont "size=12"
+    return $?
+}
+
+
+#
+# ─── DEFERRAL & SCHEDULING FUNCTIONS ──────────────────────────────────────────
+#
+
+schedule_relaunch() {
+    local hour=$1
+    local minute=$2
+    
+    log "Scheduling relaunch for Hour: $hour, Minute: $minute"
+    
+    # Unload any existing agent to ensure we are setting a new schedule
+    if [ -f "$LAUNCH_AGENT_PATH" ]; then
+        launchctl bootout "gui/$(id -u "$LOGGED_IN_USER")" "$LAUNCH_AGENT_PATH" &>/dev/null
+    fi
+
+    # Create the launch agent plist
+    cat << EOF > "$LAUNCH_AGENT_PATH"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lbg.jamf-migration</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>$0</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>$hour</integer>
+        <key>Minute</key>
+        <integer>$minute</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+EOF
+
+    # Set correct ownership and permissions
+    chown "$LOGGED_IN_USER" "$LAUNCH_AGENT_PATH"
+    chmod 644 "$LAUNCH_AGENT_PATH"
+
+    # Load the new agent
+    launchctl bootstrap "gui/$(id -u "$LOGGED_IN_USER")" "$LAUNCH_AGENT_PATH"
+    log "Launch Agent loaded and scheduled."
+}
+
+remove_relaunch_agent() {
+    if [ -f "$LAUNCH_AGENT_PATH" ]; then
+        log "Removing relaunch agent."
+        launchctl bootout "gui/$(id -u "$LOGGED_IN_USER")" "$LAUNCH_AGENT_PATH" &>/dev/null
+        rm "$LAUNCH_AGENT_PATH"
+    fi
+}
+
+handle_deferral() {
+    deferral_count=$((deferral_count + 1))
+    defaults write "$PLIST_PATH" DeferralCount -int "$deferral_count"
+    log "User deferred. New count: $deferral_count."
+
+    # Ask user for deferral period
+    defer_choice=$("$DIALOG_BINARY" --title "Choose Deferral Time" --message "When should we remind you?" \
+      --icon "$BRANDING_ICON" --width 450 --height 250 --messagefont "size=12" \
+      --button1text "1 Hour" --button2text "4 Hours" --selecttitle "Tomorrow at 9 AM" --selectvalues "24")
+
+    case $? in
+        0) # Select list
+            log "User chose to defer until tomorrow at 9 AM."
+            schedule_relaunch 9 0
+            show_dialog_info "Migration Deferred" "You will be reminded tomorrow at 9 AM."
+            ;;
+        1) # Button 1
+            log "User chose to defer for 1 hour."
+            local future_hour=$(date -v+1H +%H)
+            local future_minute=$(date -v+1H +%M)
+            schedule_relaunch "$future_hour" "$future_minute"
+            show_dialog_info "Migration Deferred" "You will be reminded in 1 hour."
+            ;;
+        2) # Button 2
+            log "User chose to defer for 4 hours."
+            local future_hour=$(date -v+4H +%H)
+            local future_minute=$(date -v+4H +%M)
+            schedule_relaunch "$future_hour" "$future_minute"
+            show_dialog_info "Migration Deferred" "You will be reminded in 4 hours."
+            ;;
+    esac
+    exit 0
+}
+
+check_deferral() {
+  if [ ! -f "$PLIST_PATH" ]; then
+    log "Plist not found. Creating with 0 deferrals."
+    mkdir -p "$(dirname "$PLIST_PATH")"
+    defaults write "$PLIST_PATH" DeferralCount -int 0
+  fi
+  
+  deferral_count=$(defaults read "$PLIST_PATH" DeferralCount 2>/dev/null || echo 0)
+  remaining_deferrals=$((MAX_DEFERRALS - deferral_count))
+
+  log "Deferral count: $deferral_count. Remaining: $remaining_deferrals."
+
+  if [ "$remaining_deferrals" -le 0 ]; then
+    show_dialog_info "Mandatory Migration" "The migration is now mandatory and the process will begin automatically."
+    remove_relaunch_agent # Clean up scheduler as it's no longer needed
+  else
+    if show_dialog_confirm "Jamf Pro Migration" "This Mac needs to be migrated to a new management system.\n\nYou have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
+        log "User chose to migrate."
+        remove_relaunch_agent # Clean up scheduler
+    else
+        handle_deferral
+    fi
+  fi
+}
+
+show_requirements_dialog() {
+    local message
+    message="To ensure a smooth migration, please verify the following requirements before you continue:\n\n"
+    message+="* **Power:** Your Mac must be connected to a power adapter.\n"
+    message+="* **Internet:** A stable internet connection is required.\n"
+    message+="* **Disk Space:** At least 5 GB of free disk space is needed.\n"
+    message+="* **OneDrive:** OneDrive must be installed, running, and fully synced.\n"
+    message+="* **Time:** System clock must be synchronized automatically.\n\n"
+    message+="This process will close all open applications and then completely wipe all data from this Mac. Ensure your data is backed up before proceeding."
+
+    if ! show_dialog_confirm "Migration Requirements" "$message" "I Understand, Continue" "Cancel"; then
+        log "User cancelled at the requirements screen."
+        exit 0
+    fi
+}
+
+
+#
+# ─── ENVIRONMENT & PREFLIGHT CHECKS ───────────────────────────────────────────
+#
+
+setup_environment() {
+    # Validate required parameters
+    local missing_params=false
+    local error_msg="Missing required parameters:"
+
+    if [ -z "$JAMF_CLIENT_ID" ]; then error_msg+="\n- JAMF_CLIENT_ID"; missing_params=true; fi
+    if [ -z "$JAMF_CLIENT_SECRET" ]; then error_msg+="\n- JAMF_CLIENT_SECRET"; missing_params=true; fi
+    if [ -z "$ORIGIN_JAMF_URL" ]; then error_msg+="\n- ORIGIN_JAMF_URL"; missing_params=true; fi
+    if [ -z "$TARGET_JAMF_URL" ]; then error_msg+="\n- TARGET_JAMF_URL"; missing_params=true; fi
+
+    if $missing_params; then
+      err "$error_msg"
+    fi
+
+    client_id="$JAMF_CLIENT_ID"
+    client_secret="$JAMF_CLIENT_SECRET"
+    origin_jamf_url="${ORIGIN_JAMF_URL%/}"
+    target_jamf_url="${TARGET_JAMF_URL%/}"
+    dry_run=$(echo "$DRY_RUN" | tr '[:upper:]' '[:lower:]')
+    [[ "$dry_run" == "true" ]] && dry_run=true || dry_run=false
+
+    log_dir=$(dirname "$LOG_FILE")
+    mkdir -p "$log_dir" 2>/dev/null
+    touch "$LOG_FILE" 2>/dev/null
+    
+    serial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
+    [ -z "$serial" ] && err "Could not determine serial number."
+}
+
+check_hardware_support() {
+    log "Checking hardware for Apple Silicon..."
+    if ! sysctl -n machdep.cpu.brand_string | grep -q "Apple"; then
+        err "This device is not an Apple Silicon Mac and is no longer supported. Please follow the process to order a new device."
+    fi
+    success "Apple Silicon Mac detected. Device is supported."
+}
+
+check_os_version() {
+    log "Checking macOS version for local erase eligibility..."
+    OS_VERSION=$(sw_vers -productVersion)
+    local os_major_version
+    os_major_version=$(echo "$OS_VERSION" | awk -F. '{print $1}')
+
+    if [[ "$os_major_version" -lt 12 ]]; then
+        err "macOS version ($OS_VERSION) is older than macOS 12. Local 'Erase All Content and Settings' is not supported."
+    else
+        success "macOS version ($OS_VERSION) supports local erase."
+    fi
+}
+
+get_connection_type() {
+  log "Determining active network service…"
+  if ! curl -s --head --connect-timeout 5 "https://www.google.co.uk/" >/dev/null 2>&1; then
+    err "No internet connectivity detected. Migration requires an active internet connection."
+  fi
+  success "Internet connectivity check passed."
+}
+
+check_device_power_type() {
+  log "Checking power source..."
+  if ! pmset -g batt | grep -q "AC Power"; then
+    err "Device is not connected to AC power. Please connect your power adapter to continue."
+  fi
+  success "Device is connected to AC power."
+}
+
+check_mdm_profile() {
+  log "Checking for active MDM profile..."
+  if ! profiles status -type enrollment | grep -q "Enrolled via DEP:"; then
+    err "No active MDM profile was detected. This device must be enrolled in MDM to proceed."
+  fi
+  success "Active MDM profile detected."
+}
+
+check_jamf_enrollment() {
+  log "Verifying current Jamf Pro enrollment status..."
+  if [[ ! -f "/usr/local/jamf/bin/jamf" ]]; then
+    err "Jamf binary not found - device not enrolled in any Jamf Pro instance."
+  fi
+  
+  local current_jss_url
+  current_jss_url=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)
+  
+  if [[ "$current_jss_url" == "$target_jamf_url"* ]]; then
+    err "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
+  elif [[ "$current_jss_url" != "$origin_jamf_url"* ]]; then
+    log "WARN: Device is enrolled in neither the origin nor target Jamf instance. Current: $current_jss_url"
+  else
+    success "Confirmed device is enrolled in origin Jamf instance."
+  fi
+}
+
+check_onedrive_status() {
+    log "Checking OneDrive status..."
+    if [[ ! -d "/Applications/OneDrive.app" ]]; then
+        err "OneDrive.app is not installed. This is required for migration."
+    fi
+
+    if ! pgrep -f "/Applications/OneDrive.app/Contents/MacOS/OneDrive" >/dev/null; then
+        err "OneDrive is not running. Please launch OneDrive before continuing."
+    fi
+
+    success "OneDrive is installed and running."
+}
+
+kill_user_apps() {
+  local excluded_patterns=("Self Service" "Terminal" "Finder" "dialog" "jamf" "Jamf")
+  log "Starting graceful application termination..."
+  
+  local app_pids=()
+  ps -ax -o pid,command | grep "/Applications/.*\.app/" | grep -v grep | while read -r pid command; do
+    local app_name
+    app_name=$(echo "$command" | sed -E 's|.*/Applications/([^/]+)\.app/.*|\1|')
+    local excluded=false
+    for pattern in "${excluded_patterns[@]}"; do
+      if [[ "$app_name" == *"$pattern"* ]]; then
+        excluded=true
+        break
+      fi
+    done
+    
+    if ! $excluded; then
+      log "Gracefully terminating $app_name (PID: $pid)"
+      run_cmd osascript -e "tell application \"$app_name\" to quit" &>/dev/null &
+      app_pids+=("$pid")
+    fi
+  done
+  
+  sleep 3
+  for pid in "${app_pids[@]}"; do
+    if kill -0 "$pid" &>/dev/null; then
+      log "Force killing PID: $pid"
+      run_cmd kill -9 "$pid"
+    fi
+  done
+}
+
+check_apns_connectivity() {
+  log "Checking connectivity to Apple Push Notification Service (APNs)..."
+  if nc -z -G 3 api.push.apple.com 443; then
+    success "APNs hostname (api.push.apple.com) is reachable on port 443."
+  else
+    err "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail."
+  fi
+}
+
+check_time_sync() {
+  log "Checking system clock sync..."
+  local offset
+  offset=$(sntp time.apple.com | awk '/^[+-]?[0-9]+\.[0-9]+/ {print $1}')
+  if [[ -z "$offset" ]]; then
+      err "Could not get time offset from time.apple.com. Check network connectivity."
+  fi
+  
+  local drift_abs
+  drift_abs=$(printf "%.0f" "$(echo "$offset" | tr -d '+-')")
+  
+  if [[ "$drift_abs" -le 180 ]]; then
+    success "System time is synced (Drift: ${offset}s)."
+  else
+    err "System time is out of sync (Drift: ${offset}s). Please enable automatic time sync."
+  fi
+}
+
+check_disk_space() {
+  log "Checking available disk space..."
+  local free_space_gb
+  free_space_gb=$(df -g / | tail -1 | awk '{print $4}')
+  
+  local required_space=5
+  
+  if [[ "$free_space_gb" -lt "$required_space" ]]; then
+    err "Less than ${required_space} GB of free disk space available. Please free up space to continue."
+  else
+    success "Disk space OK: ${free_space_gb}GB free."
+  fi
+}
+
+
+#
+# ─── JAMF PRO API FUNCTIONS ───────────────────────────────────────────────────
+#
+
+get_jamf_auth_token() {
+  log "Getting API token from origin Jamf..."
+  response=$(
+    curl -s -X POST "$origin_jamf_url/api/v1/oauth/token" \
+      -H "accept: application/json" \
+      -H "content-type: application/x-www-form-urlencoded" \
+      -d "grant_type=client_credentials&client_id=$client_id&client_secret=$client_secret"
+  )
+  bearer_token=$(echo "$response" | jq -r '.access_token')
+  [[ -z "$bearer_token" || "$bearer_token" == "null" ]] && err "Failed to get API token from Jamf Pro."
+  success "API token obtained successfully."
+}
+
+get_computer_inventory_id() {
+    log "Looking up device by serial: '$serial'"
+    local filter="hardware.serialNumber==\"$serial\""
+    local filter_encoded
+    filter_encoded=$(urlencode "$filter")
+
+    response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+        -H "Authorization: Bearer $bearer_token" \
+        "$origin_jamf_url/api/v1/computers-inventory?section=GENERAL&filter=${filter_encoded}")
+    
+    http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
+    response_body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_status" -ne 200 ]]; then
+        err "Jamf API request failed with HTTP status $http_status."
+    fi
+
+    computer_id=$(echo "$response_body" | jq -r '.results[0].id')
+    
+    [[ -z "$computer_id" || "$computer_id" == "null" ]] && err "Computer ID not found in Jamf Pro API response."
+
+    success "Found Computer ID: $computer_id"
+}
+
+clear_failed_commands() {
+  log "Clearing any existing failed or pending commands in Jamf Pro..."
+  local payload='{"statuses": ["FAILED", "PENDING"]}'
+  
+  response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+    "$origin_jamf_url/api/v1/computers-inventory/$computer_id/commands/flush" \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -d "$payload")
+
+  http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
+  
+  if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]]; then
+    success "Successfully cleared failed/pending commands (HTTP $http_status)."
+  else
+    # This is not a critical failure, so just log a warning.
+    log "WARN: Could not clear failed commands (HTTP $http_status). This is non-critical, proceeding anyway."
+  fi
+}
+
+trigger_local_erase() {
+    log "Initiating local 'Erase All Content and Settings' via osascript..."
+    
+    if $dry_run; then
+        log "[DRY-RUN] Would have used osascript to trigger 'sharingd -e'."
+        success "[DRY-RUN] Fast local erase would have been initiated."
+        return
+    fi
+    
+    show_dialog_info "Wipe In Progress" "The device wipe process will now begin. This Mac will restart to the setup screen shortly. This may take a few minutes."
+    
+    # We use osascript to run the command within the user's graphical session context.
+    # The 'sudo -u' ensures this osascript command is executed as the logged-in user.
+    # We explicitly set the PATH for the subshell to ensure it can find the command.
+    local script_output
+    script_output=$(sudo -u "$LOGGED_IN_USER" osascript -e 'do shell script "PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/sharingd -e"' 2>&1)
+    
+    local exit_code=$?
+    if [[ $exit_code -eq 0 ]]; then
+        success "Erase command sent successfully via osascript. The device will now be erased."
+        exit 0
+    else
+        log "osascript command failed. Output: $script_output"
+        err "Failed to send local erase command via osascript (Exit code: $exit_code). Please check system logs."
+    fi
+}
+
+
+#
+# ─── MAIN EXECUTION ───────────────────────────────────────────────────────────
+#
+
+main() {
+  setup_environment
+  check_hardware_support # This is now the first critical check
+  check_deferral
+  show_requirements_dialog
+
+  # --- Run all preflight checks ---
+  check_os_version
+  check_disk_space
+  check_device_power_type
+  get_connection_type
+  check_time_sync
+  check_onedrive_status
+  check_apns_connectivity
+  check_jamf_enrollment
+  check_mdm_profile
+  
+  log "All preflight checks passed."
+
+  # --- Get Jamf Info ---
+  get_jamf_auth_token
+  get_computer_inventory_id
+  clear_failed_commands
+
+  # --- Final Warning & App Kill ---
+  if ! show_dialog_confirm "Final Warning" "All applications will now be closed and the device will be wiped.\n\nThis is your last chance to cancel." "Wipe Mac Now" "Cancel"; then
+      log "User cancelled at final warning."
+      exit 0
+  fi
+  
+  kill_user_apps
+
+  # --- Execute Wipe ---
+  if $dry_run; then
+    success "[DRY-RUN] Migration would have proceeded. Device wipe command not sent."
+    show_dialog_info "Dry-Run Complete" "All checks passed successfully. In a real run, the wipe command would have been sent."
+  else
+    trigger_local_erase
+  fi
+}
+
+main "$@"
+
