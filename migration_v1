@@ -1,0 +1,472 @@
+#!/bin/zsh
+
+#
+# ─── SCRIPT CONFIGURATION ─────────────────────────────────────────────────────
+#
+
+# --- Deferral Settings ---
+MAX_DEFERRALS=3 # Number of times the user can defer
+PLIST_PATH="/Library/Application Support/LBG/com.lbg.jamf-migration.plist"
+
+# --- SwiftDialog Settings ---
+DIALOG_BINARY="/usr/local/bin/dialog"
+DIALOG_ICON="https://i.imgur.com/2A23259.png" # LBG Logo
+
+# --- Jamf API Credentials & Endpoints ---
+JAMF_CLIENT_ID="${4:-$JAMF_CLIENT_ID}"
+JAMF_CLIENT_SECRET="${5:-$JAMF_CLIENT_SECRET}"
+ORIGIN_JAMF_URL="${6:-$ORIGIN_JAMF_URL}"
+TARGET_JAMF_URL="${7:-$TARGET_JAMF_URL}"
+DRY_RUN="${8:-${DRY_RUN:-false}}"
+
+#
+# ─── LOGGING AND UTILITIES ────────────────────────────────────────────────────
+#
+
+LOG_FILE="$HOME/jamf_migration_preflight.log"
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
+
+log() {
+  printf '%b[%s] [INFO]  %s%b\n' \
+    "$YELLOW" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" | tee -a "$LOG_FILE"
+}
+
+success() {
+  printf '%b[%s] [SUCCESS] %s%b\n' \
+    "$GREEN" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" | tee -a "$LOG_FILE"
+}
+
+err() {
+  printf '%b[%s] [ERROR] %s%b\n' \
+    "$RED" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" | tee -a "$LOG_FILE" >&2
+  show_dialog_error "An unexpected error occurred. Please check the log file for details: $LOG_FILE"
+  exit 1
+}
+
+run_cmd() {
+  if $dry_run && [[ "$1" == "kill" ]]; then
+    log "[DRY-RUN] Would execute: $*"
+  else
+    "$@"
+  fi
+}
+
+urlencode() {
+  python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "$1"
+}
+
+
+#
+# ─── SWIFTDIALOG FUNCTIONS ────────────────────────────────────────────────────
+#
+
+show_dialog_error() {
+  local message="$1"
+  "$DIALOG_BINARY" \
+    --title "Migration Error" \
+    --message "$message" \
+    --icon "SF=xmark.octagon.fill,colour=red" \
+    --button1text "Close"
+}
+
+show_dialog_info() {
+    local title="$1"
+    local message="$2"
+    "$DIALOG_BINARY" \
+        --title "$title" \
+        --message "$message" \
+        --icon "$DIALOG_ICON" \
+        --button1text "OK"
+}
+
+show_dialog_confirm() {
+    local title="$1"
+    local message="$2"
+    local button1_text="${3:-Proceed}"
+    local button2_text="${4:-Cancel}"
+
+    "$DIALOG_BINARY" \
+        --title "$title" \
+        --message "$message" \
+        --icon "$DIALOG_ICON" \
+        --button1text "$button1_text" \
+        --button2text "$button2_text"
+    
+    return $?
+}
+
+
+#
+# ─── DEFERRAL FUNCTIONS ───────────────────────────────────────────────────────
+#
+
+check_deferral() {
+  if [ ! -f "$PLIST_PATH" ]; then
+    log "Plist not found. Creating with 0 deferrals."
+    mkdir -p "$(dirname "$PLIST_PATH")"
+    defaults write "$PLIST_PATH" DeferralCount -int 0
+  fi
+  
+  deferral_count=$(defaults read "$PLIST_PATH" DeferralCount 2>/dev/null || echo 0)
+  remaining_deferrals=$((MAX_DEFERRALS - deferral_count))
+
+  log "Deferral count: $deferral_count. Remaining: $remaining_deferrals."
+
+  if [ "$remaining_deferrals" -le 0 ]; then
+    show_dialog_info "Mandatory Migration" "The migration is now mandatory. The process will begin automatically."
+  else
+    if show_dialog_confirm "Jamf Pro Migration" "This Mac needs to be migrated to a new management system.\n\nYou have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
+        log "User chose to migrate."
+    else
+        deferral_count=$((deferral_count + 1))
+        defaults write "$PLIST_PATH" DeferralCount -int "$deferral_count"
+        log "User deferred. New count: $deferral_count."
+        show_dialog_info "Migration Deferred" "The migration has been deferred. You will be reminded again later."
+        exit 0
+    fi
+  fi
+}
+
+
+#
+# ─── ENVIRONMENT & PREFLIGHT CHECKS ───────────────────────────────────────────
+#
+
+setup_environment() {
+    # Validate required parameters
+    local missing_params=false
+    local error_msg="Missing required parameters:"
+
+    if [ -z "$JAMF_CLIENT_ID" ]; then error_msg+="\n- JAMF_CLIENT_ID"; missing_params=true; fi
+    if [ -z "$JAMF_CLIENT_SECRET" ]; then error_msg+="\n- JAMF_CLIENT_SECRET"; missing_params=true; fi
+    if [ -z "$ORIGIN_JAMF_URL" ]; then error_msg+="\n- ORIGIN_JAMF_URL"; missing_params=true; fi
+    if [ -z "$TARGET_JAMF_URL" ]; then error_msg+="\n- TARGET_JAMF_URL"; missing_params=true; fi
+
+    if $missing_params; then
+      err "$error_msg"
+    fi
+
+    client_id="$JAMF_CLIENT_ID"
+    client_secret="$JAMF_CLIENT_SECRET"
+    origin_jamf_url="${ORIGIN_JAMF_URL%/}"
+    target_jamf_url="${TARGET_JAMF_URL%/}"
+    dry_run=$(echo "$DRY_RUN" | tr '[:upper:]' '[:lower:]')
+    [[ "$dry_run" == "true" ]] && dry_run=true || dry_run=false
+
+    # Setup logging
+    log_dir=$(dirname "$LOG_FILE")
+    mkdir -p "$log_dir" || err "Cannot create log directory $log_dir"
+    touch "$LOG_FILE" 2>/dev/null || err "Cannot write to log file $LOG_FILE"
+    
+    echo "Starting Jamf migration preflight check..." | tee -a "$LOG_FILE"
+    if $dry_run; then
+      echo "Running in DRY-RUN mode - device will NOT be wiped" | tee -a "$LOG_FILE"
+    fi
+
+    serial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
+    [ -z "$serial" ] && err "Could not determine serial number"
+    logged_in_user=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
+    [ -z "$logged_in_user" ] && err "Unable to detect logged-in user."
+}
+
+check_device_support() {
+    log "Checking device age and support status..."
+    cpu_info=$(sysctl -n machdep.cpu.brand_string)
+    [[ -z "$cpu_info" ]] && err "Unable to detect CPU info."
+    log "CPU Info: $cpu_info"
+
+    case "$cpu_info" in
+        *"Intel(R) Core(TM) i5-8259U"*) year_from_cpu=2018 ;;
+        *"Intel(R) Core(TM) i7-8559U"*) year_from_cpu=2018 ;;
+        *"Apple M1"*) year_from_cpu=2020 ;;
+        *"Apple M2"*) year_from_cpu=2022 ;;
+        *"Apple M3"*) year_from_cpu=2024 ;;
+        *"Apple M4"*) year_from_cpu=2025 ;;
+        *) year_from_cpu=0 ;;
+    esac
+
+    if [[ "$year_from_cpu" -eq 0 ]]; then
+        log "WARN: Could not determine device year from CPU. Skipping age check."
+        return 0
+    fi
+    
+    log "Year from CPU: $year_from_cpu"
+    current_year=$(date +%Y)
+    age_of_device=$((current_year - year_from_cpu))
+
+    if [[ $age_of_device -gt 4 ]]; then
+        err "This device is no longer in support. Please order a new device through the IT@LBG process."
+    else
+        success "Device is in support."
+    fi
+}
+
+get_connection_type() {
+  log "Determining active network service…"
+  local primary_if
+  primary_if=$(route get default 2>/dev/null | awk '/interface:/ {print $2}')
+  if [[ -z "$primary_if" ]]; then
+    err "No network connectivity detected (no default route). Migration requires network connectivity."
+  fi
+  
+  if ! curl -s --head --connect-timeout 5 "https://www.google.co.uk/" >/dev/null 2>&1; then
+    err "No internet connectivity detected (cannot connect to google.co.uk). Migration requires internet connectivity."
+  fi
+  success "Network and internet connectivity checks passed."
+}
+
+check_device_power_type() {
+  log "Checking power source and battery level..."
+  local power_status
+  power_status=$(pmset -g batt)
+  
+  if echo "$power_status" | grep -q "AC Power"; then
+    success "Device is connected to AC power."
+    return 0
+  fi
+  
+  local battery_percent
+  battery_percent=$(echo "$power_status" | grep -o "[0-9]*%" | tr -d '%')
+  local minimum_battery=85
+  
+  if [[ "$battery_percent" -ge "$minimum_battery" ]]; then
+    success "Battery level is sufficient (${battery_percent}%)."
+  else
+    err "Battery level is too low (${battery_percent}%). Please connect to AC power."
+  fi
+}
+
+check_mdm_profile() {
+  log "Checking for active MDM profile..."
+  if profiles status -type enrollment | grep -q "Enrolled via DEP:"; then
+    success "Active MDM profile detected."
+  else
+    err "No active MDM profile was detected. This device must be enrolled in MDM to proceed."
+  fi
+}
+
+check_jamf_enrollment() {
+  log "Verifying current Jamf Pro enrollment status..."
+  if [[ ! -f "/usr/local/jamf/bin/jamf" ]]; then
+    err "Jamf binary not found - device not enrolled in any Jamf Pro instance."
+  fi
+  
+  local current_jss_url
+  current_jss_url=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)
+  
+  if [[ "$current_jss_url" == "$target_jamf_url"* ]]; then
+    err "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
+  elif [[ "$current_jss_url" != "$origin_jamf_url"* ]]; then
+    log "WARN: Device is enrolled in neither the origin nor target Jamf instance. Current: $current_jss_url"
+  else
+    success "Confirmed device is enrolled in origin Jamf instance: $current_jss_url"
+  fi
+}
+
+check_onedrive_status() {
+    log "Checking OneDrive status for user $logged_in_user…"
+    if [[ ! -d "/Applications/OneDrive.app" ]]; then
+        err "OneDrive.app is not installed. This is required for migration."
+    fi
+
+    if ! pgrep -f "/Applications/OneDrive.app/Contents/MacOS/OneDrive" >/dev/null; then
+        err "OneDrive is not running. Please launch OneDrive before continuing."
+    fi
+
+    if pgrep -f "OneDrive File Provider" >/dev/null; then
+        err "OneDrive is currently syncing. Please wait for the sync to complete before proceeding."
+    fi
+    success "OneDrive is installed, running, and not actively syncing."
+}
+
+kill_user_apps() {
+  local excluded_patterns=("Self Service" "Terminal" "Finder" "dialog" "jamf" "Jamf")
+  log "Starting graceful application termination..."
+  
+  local app_pids=()
+  ps -ax -o pid,command | grep "/Applications/.*\.app/" | grep -v grep | while read -r pid command; do
+    local app_name
+    app_name=$(echo "$command" | sed -E 's|.*/Applications/([^/]+)\.app/.*|\1|')
+    local excluded=false
+    for pattern in "${excluded_patterns[@]}"; do
+      if [[ "$app_name" == *"$pattern"* ]]; then
+        excluded=true
+        break
+      fi
+    done
+    
+    if ! $excluded; then
+      log "Gracefully terminating $app_name (PID: $pid)"
+      run_cmd osascript -e "tell application \"$app_name\" to quit" &>/dev/null &
+      app_pids+=("$pid")
+    fi
+  done
+  
+  sleep 3
+  for pid in "${app_pids[@]}"; do
+    if kill -0 "$pid" &>/dev/null; then
+      log "Force killing PID: $pid"
+      run_cmd kill -9 "$pid"
+    fi
+  done
+}
+
+check_apns_connectivity() {
+  log "Checking connectivity to Apple Push Notification Service (APNs)..."
+  if nc -z -G 3 api.push.apple.com 443; then
+    success "APNs hostname (api.push.apple.com) is reachable on port 443."
+  else
+    err "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail."
+  fi
+}
+
+check_time_sync() {
+  log "Checking system clock sync..."
+  local offset
+  offset=$(sntp time.apple.com | awk '/^[+-]?[0-9]+\.[0-9]+/ {print $1}')
+  if [[ -z "$offset" ]]; then
+      err "Could not get time offset from time.apple.com. Check network connectivity."
+  fi
+  
+  local drift_abs
+  drift_abs=$(printf "%.0f" "$(echo "$offset" | tr -d '+-')")
+  
+  if [[ "$drift_abs" -le 180 ]]; then
+    success "System time is synced (Drift: ${offset}s)."
+  else
+    err "System time is out of sync (Drift: ${offset}s). Please enable automatic time sync."
+  fi
+}
+
+check_disk_space() {
+  log "Checking available disk space..."
+  local free_space_gb
+  free_space_gb=$(df -g / | tail -1 | awk '{print $4}')
+  
+  if [[ "$free_space_gb" -lt 5 ]]; then
+    err "Less than 5 GB of free disk space available. Please free up space to continue."
+  else
+    success "Disk space OK: ${free_space_gb}GB free."
+  fi
+}
+
+#
+# ─── JAMF PRO API FUNCTIONS ───────────────────────────────────────────────────
+#
+
+get_jamf_auth_token() {
+  log "Getting API token from origin Jamf..."
+  response=$(
+    curl -s -X POST "$origin_jamf_url/api/v1/oauth/token" \
+      -H "accept: application/json" \
+      -H "content-type: application/x-www-form-urlencoded" \
+      -d "grant_type=client_credentials&client_id=$client_id&client_secret=$client_secret"
+  )
+  bearer_token=$(echo "$response" | jq -r '.access_token')
+  [[ -z "$bearer_token" || "$bearer_token" == "null" ]] && err "Failed to get API token from Jamf Pro."
+  success "API token obtained successfully."
+}
+
+get_computer_inventory_id() {
+    log "Looking up device by serial: '$serial'"
+    local filter="hardware.serialNumber==\"$serial\""
+    local filter_encoded
+    filter_encoded=$(urlencode "$filter")
+
+    response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+        -H "Authorization: Bearer $bearer_token" \
+        "$origin_jamf_url/api/v1/computers-inventory?section=GENERAL&filter=${filter_encoded}")
+    
+    http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
+    response_body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_status" -ne 200 ]]; then
+        err "Jamf API request failed with HTTP status $http_status."
+    fi
+
+    computer_id=$(echo "$response_body" | jq -r '.results[0].id')
+    management_id=$(echo "$response_body" | jq -r '.results[0].general.managementId')
+    
+    [[ -z "$computer_id" || "$computer_id" == "null" ]] && err "Computer ID not found in Jamf Pro API response."
+    [[ -z "$management_id" || "$management_id" == "null" ]] && err "Management ID not found in Jamf Pro API response."
+
+    success "Found Computer ID: $computer_id and Management ID: $management_id"
+}
+
+send_wipe_command() {
+  log "Refreshing API token before wipe…"
+  get_jamf_auth_token
+
+  log "Sending ERASE_DEVICE command..."
+  payload=$(printf '{
+    "commandData": { "commandType": "ERASE_DEVICE", "obliterationBehavior": "Always", "pin": "123456" },
+    "clientData": [{"managementId":"%s"}]
+  }' "$management_id")
+
+  response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$origin_jamf_url/api/v2/mdm/commands" \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -d "$payload")
+    
+  http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
+  response_body=$(echo "$response" | sed '$d')
+
+  if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]]; then
+    success "Wipe command sent successfully (HTTP $http_status)."
+    show_dialog_info "Migration In Progress" "The wipe command has been sent to this Mac. It will restart shortly to begin the process."
+  else
+    err "Wipe command failed with HTTP status $http_status. Response: $response_body"
+  fi
+}
+
+
+#
+# ─── MAIN EXECUTION ───────────────────────────────────────────────────────────
+#
+
+main() {
+  setup_environment
+  check_deferral
+
+  # --- Start of Preflight ---
+  if ! show_dialog_confirm "Data Backup Confirmation" "This Mac will be WIPED as part of the migration process.\n\nPlease confirm all your important data is backed up and synced to OneDrive.\n\nTHIS ACTION CANNOT BE UNDONE." "I Confirm, Proceed" "Cancel"; then
+      log "User cancelled at backup confirmation."
+      exit 0
+  fi
+
+  # --- Run all checks ---
+  check_device_support
+  check_device_power_type
+  get_connection_type
+  check_time_sync
+  check_disk_space
+  check_onedrive_status
+  check_apns_connectivity
+  check_jamf_enrollment
+  check_mdm_profile
+  
+  log "All preflight checks passed."
+
+  # --- Get Jamf Info ---
+  get_jamf_auth_token
+  get_computer_inventory_id
+
+  # --- Final Warning & App Kill ---
+  if ! show_dialog_confirm "FINAL WARNING" "All checks have passed. All applications will now be closed and the device will be wiped.\n\nThis is your last chance to cancel." "Wipe Mac Now" "Cancel"; then
+      log "User cancelled at final warning."
+      exit 0
+  fi
+  
+  kill_user_apps
+
+  # --- Execute Wipe ---
+  if $dry_run; then
+    success "[DRY-RUN] Migration would have proceeded. Device wipe command not sent."
+    show_dialog_info "Dry-Run Complete" "All checks passed successfully. In a real run, the wipe command would have been sent."
+  else
+    send_wipe_command
+  fi
+}
+
+main "$@"
+
