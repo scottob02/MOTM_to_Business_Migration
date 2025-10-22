@@ -13,7 +13,6 @@ LAUNCH_AGENT_PATH="/Users/$LOGGED_IN_USER/Library/LaunchAgents/com.lbg.jamf-migr
 
 # --- SwiftDialog Settings ---
 DIALOG_BINARY="/usr/local/bin/dialog"
-# This should point to the icon in your local branding package
 BRANDING_ICON="/Users/Shared/LBG_Branding_Cancara/lbg_primary_logo.png" 
 
 # --- Jamf API Credentials & Endpoints ---
@@ -206,7 +205,7 @@ check_deferral() {
     show_dialog_info "Mandatory Migration" "The migration is now mandatory and the process will begin automatically."
     remove_relaunch_agent # Clean up scheduler as it's no longer needed
   else
-    if show_dialog_confirm "Jamf Pro Migration" "This Mac needs to be migrated to a new management system.\n\nYou have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
+    if show_dialog_confirm "StratMac to LBG Business Migration" "This Mac is now due to migrate over to new LBG Business build for Apple Mac devices.\n\n The entire process will take roughly 1 hour depending on your internet speed.\n\n You have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
         log "User chose to migrate."
         remove_relaunch_agent # Clean up scheduler
     else
@@ -217,12 +216,10 @@ check_deferral() {
 
 show_requirements_dialog() {
     local message
-    message="To ensure a smooth migration, please verify the following requirements before you continue:\n\n"
+    message="To ensure a smooth migration to LBG Business, please verify the following requirements before you continue:\n\n"
     message+="* **Power:** Your Mac must be connected to a power adapter.\n"
     message+="* **Internet:** A stable internet connection is required.\n"
-    message+="* **Disk Space:** At least 5 GB of free disk space is needed.\n"
-    message+="* **OneDrive:** OneDrive must be installed, running, and fully synced.\n"
-    message+="* **Time:** System clock must be synchronized automatically.\n\n"
+    message+="* **Data Backed-up:** Any information, files, or notes you wish to keep much be saved and uploaded to OneDrive. Anything not stored in OneDrive will be permanetly deleted. \n\n"
     message+="This process will close all open applications and then completely wipe all data from this Mac. Ensure your data is backed up before proceeding."
 
     if ! show_dialog_confirm "Migration Requirements" "$message" "I Understand, Continue" "Cancel"; then
