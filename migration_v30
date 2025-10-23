@@ -177,7 +177,7 @@ handle_deferral() {
     defer_choice=$("$DIALOG_BINARY" --title "Choose Deferral Time" \
       --message "When should we remind you? This prompt will reappear at the time you select." \
       --icon "$BRANDING_ICON" --width 450 --height 250 --messagefont "size=12" \
-      --select "title=Deferral Options, values=${defer_options}, default=1 hour" \
+      --select "title=Deferral Options, values=\"${defer_options}\", default=1 hour" \
       --button1text "Confirm Deferral")
     
     # Exit if user hits Cancel (returns non-zero)
