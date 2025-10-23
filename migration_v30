@@ -170,37 +170,33 @@ handle_deferral() {
     local current_hour
     current_hour=$(date +%H)
     
-    # Ask user for deferral period using a dropdown list
+    # Reordered list as requested
+    local defer_options="Start of Day (9am), Lunch (12pm), End of Day (5pm), 1 hour, 2 hours, 4 hours"
+    
+    # Ask user for deferral period using the modern --select syntax
     defer_choice=$("$DIALOG_BINARY" --title "Choose Deferral Time" \
       --message "When should we remind you? This prompt will reappear at the time you select." \
       --icon "$BRANDING_ICON" --width 450 --height 250 --messagefont "size=12" \
-      --selecttitle "Deferral Options" \
-      --selectvalues "1 hour, 2 hours, 4 hours, Lunch (12pm), End of Day (5pm), Start of Day (9am)" \
-      --selectdefault "1 hour" \
+      --select "title=Deferral Options, values=${defer_options}, default=1 hour" \
       --button1text "Confirm Deferral")
     
     # Exit if user hits Cancel (returns non-zero)
     [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
     
-    # The output from --selectvalues is the selected value, e.g. "1 hour"
+    # DEBUG line to see what swiftDialog is *actually* outputting
+    log "DEBUG: User selected deferral choice: '$defer_choice'"
+    
+    # Reordered case statement to match the new list
     case "$defer_choice" in
-        "1 hour")
-            future_hour=$(date -v+1H +%H)
-            future_minute=$(date -v+1H +%M)
-            friendly_time=$(date -v+1H +"today at %-I:%M %p")
-            log "User chose to defer for 1 hour."
-            ;;
-        "2 hours")
-            future_hour=$(date -v+2H +%H)
-            future_minute=$(date -v+2H +%M)
-            friendly_time=$(date -v+2H +"today at %-I:%M %p")
-            log "User chose to defer for 2 hours."
-            ;;
-        "4 hours")
-            future_hour=$(date -v+4H +%H)
-            future_minute=$(date -v+4H +%M)
-            friendly_time=$(date -v+4H +"today at %-I:%M %p")
-            log "User chose to defer for 4 hours."
+        "Start of Day (9am)")
+            future_hour=9
+            future_minute=0
+            if [[ "$current_hour" -lt 9 ]]; then
+                friendly_time="today at 9:00 AM"
+            else
+                friendly_time=$(date -v+1d +"tomorrow at 9:00 AM")
+            fi
+            log "User chose to defer until 9 AM."
             ;;
         "Lunch (12pm)")
             future_hour=12
@@ -222,18 +218,26 @@ handle_deferral() {
             fi
             log "User chose to defer until 5 PM."
             ;;
-        "Start of Day (9am)")
-            future_hour=9
-            future_minute=0
-            if [[ "$current_hour" -lt 9 ]]; then
-                friendly_time="today at 9:00 AM"
-            else
-                friendly_time=$(date -v+1d +"tomorrow at 9:00 AM")
-            fi
-            log "User chose to defer until 9 AM."
+        "1 hour")
+            future_hour=$(date -v+1H +%H)
+            future_minute=$(date -v+1H +%M)
+            friendly_time=$(date -v+1H +"today at %-I:%M %p")
+            log "User chose to defer for 1 hour."
+            ;;
+        "2 hours")
+            future_hour=$(date -v+2H +%H)
+            future_minute=$(date -v+2H +%M)
+            friendly_time=$(date -v+2H +"today at %-I:%M %p")
+            log "User chose to defer for 2 hours."
+            ;;
+        "4 hours")
+            future_hour=$(date -v+4H +%H)
+            future_minute=$(date -v+4H +%M)
+            friendly_time=$(date -v+4H +"today at %-I:%M %p")
+            log "User chose to defer for 4 hours."
             ;;
         *)
-            log "Invalid deferral choice: $defer_choice. Defaulting to 1 hour."
+            log "ERROR: Deferral choice '$defer_choice' did not match. Defaulting to 1 hour."
             future_hour=$(date -v+1H +%H)
             future_minute=$(date -v+1H +%M)
             friendly_time=$(date -v+1H +"today at %-I:%M %p")
@@ -630,4 +634,3 @@ This action cannot be undone." \
 }
 
 main "$@"
-
