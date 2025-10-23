@@ -170,24 +170,44 @@ handle_deferral() {
     local current_hour
     current_hour=$(date +%H)
     
-    # --- NEW SOLUTION: Use --dropdown ---
-    # This is a much simpler and more robust command than --select.
-    # It takes a simple comma-separated list.
+    # ---
+    # --- THIS IS THE FINAL, ROBUST FIX ---
+    # ---
+    # We will build the command in a zsh array. This is the
+    # *only* reliable way to pass arguments with spaces and
+    # special characters to another command. This completely
+    # avoids all the quoting issues we have been fighting.
+
+    # 1. Define the options in an array.
+    local -a defer_options=(
+        "Start of Day (9am)"
+        "Lunch (12pm)"
+        "End of Day (5pm)"
+        "1 hour"
+        "2 hours"
+        "4 hours"
+    )
+
+    # 2. Build the full swiftDialog command in an array.
+    #    We use --select and --values (separate flags), which is a
+    #    robust syntax that accepts arrays.
+    local -a dialog_cmd=(
+        "$DIALOG_BINARY"
+        --title "Choose Deferral Time"
+        --message "When should we remind you? This prompt will reappear at the time you select."
+        --icon "$BRANDING_ICON"
+        --width 450
+        --height 250
+        --messagefont "size=12"
+        --select "title=Deferral Options, required"
+        --values "${defer_options[@]}"
+        --default "1 hour"
+        --button1text "Confirm Deferral"
+        --button2text "Cancel"
+    )
     
-    local dropdown_options="'Start of Day (9am)','Lunch (12pm)','End of Day (5pm)','1 hour','2 hours','4 hours'"
-    
-    defer_choice=$("$DIALOG_BINARY" \
-        --title "Choose Deferral Time" \
-        --message "When should we remind you? This prompt will reappear at the time you select." \
-        --icon "$BRANDING_ICON" \
-        --width 450 \
-        --height 250 \
-        --messagefont "size=12" \
-        --dropdown "Deferral Options, $dropdown_options" \
-        --default "1 hour" \
-        --button1text "Confirm Deferral" \
-        --button2text "Cancel")
-    
+    # 3. Execute the command and capture the output.
+    defer_choice=$("${dialog_cmd[@]}")
     local exit_code=$?
     
     # DEBUG line to see what swiftDialog is *actually* outputting
@@ -201,7 +221,7 @@ handle_deferral() {
         exit 0
     fi
     
-    # Updated case statement to match the literal string output
+    # The case statement already matches the full strings, so it's correct.
     case "$defer_choice" in
         'Start of Day (9am)')
             future_hour=9
