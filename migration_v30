@@ -170,19 +170,25 @@ handle_deferral() {
     local current_hour
     current_hour=$(date +%H)
     
-    # Define the options with single quotes around each value
-    local defer_options="'Start of Day (9am)','Lunch (12pm)','End of Day (5pm)','1 hour','2 hours','4 hours'"
-    # The default value must also be one of the quoted strings
-    local default_option="'1 hour'"
+    # --- Robust Argument Building using a zsh Array ---
+    # This is the correct, modern way to pass complex arguments.
+    local -a dialog_args
+    dialog_args=(
+        --title "Choose Deferral Time"
+        --message "When should we remind you? This prompt will reappear at the time you select."
+        --icon "$BRANDING_ICON"
+        --width 450
+        --height 250
+        --messagefont "size=12"
+        # CRITICAL FIX: The entire --select argument is now a SINGLE element
+        # in the array, with all its internal quotes intact.
+        --select "title=Deferral Options, values='Start of Day (9am)','Lunch (12pm)','End of Day (5pm)','1 hour','2 hours','4 hours', default='1 hour'"
+        --button1text "Confirm Deferral"
+    )
     
-    # Ask user for deferral period.
-    # CRITICAL FIX: The entire --select argument is NO LONGER in quotes.
-    # This allows the shell to correctly expand the variables with their own internal quotes.
-    defer_choice=$("$DIALOG_BINARY" --title "Choose Deferral Time" \
-      --message "When should we remind you? This prompt will reappear at the time you select." \
-      --icon "$BRANDING_ICON" --width 450 --height 250 --messagefont "size=12" \
-      --select title="Deferral Options",values=${defer_options},default=${default_option} \
-      --button1text "Confirm Deferral")
+    # Execute the command by expanding the array.
+    # The shell will now pass each argument correctly.
+    defer_choice=$("$DIALOG_BINARY" "${dialog_args[@]}")
     
     # Exit if user hits Cancel (returns non-zero)
     [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
