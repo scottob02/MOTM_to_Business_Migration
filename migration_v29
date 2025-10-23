@@ -6,10 +6,10 @@
 
 # --- Deferral Settings ---
 MAX_DEFERRALS=5
-PLIST_PATH="/Users/Shared/LBG/com.lbg.jamf-migration.plist"
+PLIST_PATH="/Users/$LOGGED_IN_USER/Library/Application Support/LBG/com.lbg.jamf-migration.plist"
 LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
 LAUNCH_AGENT_PATH="/Users/$LOGGED_IN_USER/Library/LaunchAgents/com.lbg.jamf-migration.plist"
-SCRIPT_PATH="/Users/Shared/LBG/jamf_migration.sh"
+SCRIPT_PATH="/Users/$LOGGED_IN_USER/Library/Application Support/LBG/jamf_migration.sh"
 
 
 # --- SwiftDialog Settings ---
@@ -126,7 +126,7 @@ schedule_relaunch() {
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
-        <string>/Users/Shared/LBG/jamf_migration.sh</string>
+        <string>$SCRIPT_PATH</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -240,14 +240,23 @@ handle_deferral() {
     schedule_relaunch "$future_hour" "$future_minute"
     show_dialog_info "Migration Deferred" "You will be reminded $friendly_time."
     
+    # We must also chown the plist, as this function may create it
+    chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
+    
     exit 0
 }
 
 check_deferral() {
   if [ ! -f "$PLIST_PATH" ]; then
     log "Plist not found. Creating with 0 deferrals."
-    mkdir -p "$(dirname "$PLIST_PATH")"
+    local plist_dir
+    plist_dir=$(dirname "$PLIST_PATH")
+    mkdir -p "$plist_dir"
+    # Set ownership of the new directory to the user
+    chown -R "$LOGGED_IN_USER" "$plist_dir"
     defaults write "$PLIST_PATH" DeferralCount -int 0
+    # Set ownership of the new plist to the user
+    chown "$LOGGED_IN_USER" "$PLIST_PATH"
   fi
   
   deferral_count=$(defaults read "$PLIST_PATH" DeferralCount 2>/dev/null || echo 0)
@@ -319,8 +328,8 @@ ensure_script_is_permanent() {
     local script_dir
     script_dir=$(dirname "$SCRIPT_PATH")
     
-    log "Listing permissions for /Users/Shared:"
-    ls -ld "/Users/Shared" | tee -a "$LOG_FILE"
+    log "Listing permissions for /Users/$LOGGED_IN_USER/Library/Application Support:"
+    ls -ld "/Users/$LOGGED_IN_USER/Library/Application Support" | tee -a "$LOG_FILE"
 
     if [[ ! -d "$script_dir" ]]; then
         log "Creating directory: $script_dir"
@@ -332,14 +341,14 @@ ensure_script_is_permanent() {
         fi
         log "Directory created. Setting permissions."
         # --- THIS IS THE FIX ---
-        # Explicitly set owner and group to root:wheel
-        chown root:wheel "$script_dir"
+        # Explicitly set owner to the logged-in user
+        chown -R "$LOGGED_IN_USER" "$script_dir"
         chmod 755 "$script_dir"
     else
         log "Directory $script_dir already exists."
         # Ensure correct ownership even if it exists
         log "Verifying ownership of existing directory..."
-        chown root:wheel "$script_dir"
+        chown -R "$LOGGED_IN_USER" "$script_dir"
         chmod 755 "$script_dir"
     fi
     
@@ -373,7 +382,7 @@ ensure_script_is_permanent() {
     # 4. Make it executable
     log "Write successful. Setting final permissions..."
     chmod 755 "$SCRIPT_PATH"
-    chown root:wheel "$SCRIPT_PATH"
+    chown "$LOGGED_IN_USER" "$SCRIPT_PATH"
     
     log "Script is now located at $SCRIPT_PATH"
     
