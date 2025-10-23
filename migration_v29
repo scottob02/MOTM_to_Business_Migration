@@ -331,10 +331,16 @@ ensure_script_is_permanent() {
             err "ensure_script_is_permanent" "Failed to create script directory at $script_dir. Deferral will not work."
         fi
         log "Directory created. Setting permissions."
-        chmod 755 "$script_dir"
+        # --- THIS IS THE FIX ---
+        # Explicitly set owner and group to root:wheel
         chown root:wheel "$script_dir"
+        chmod 755 "$script_dir"
     else
         log "Directory $script_dir already exists."
+        # Ensure correct ownership even if it exists
+        log "Verifying ownership of existing directory..."
+        chown root:wheel "$script_dir"
+        chmod 755 "$script_dir"
     fi
     
     log "Listing permissions for $script_dir:"
