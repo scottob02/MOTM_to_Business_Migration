@@ -6,10 +6,10 @@
 
 # --- Deferral Settings ---
 MAX_DEFERRALS=5
-PLIST_PATH="/usr/local/lbg/com.lbg.jamf-migration.plist"
+PLIST_PATH="/Users/Shared/LBG/com.lbg.jamf-migration.plist"
 LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
 LAUNCH_AGENT_PATH="/Users/$LOGGED_IN_USER/Library/LaunchAgents/com.lbg.jamf-migration.plist"
-SCRIPT_PATH="/usr/local/lbg/jamf_migration.sh"
+SCRIPT_PATH="/Users/Shared/LBG/jamf_migration.sh"
 
 
 # --- SwiftDialog Settings ---
@@ -126,7 +126,7 @@ schedule_relaunch() {
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
-        <string>/usr/local/lbg/jamf_migration.sh</string>
+        <string>/Users/Shared/LBG/jamf_migration.sh</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -319,8 +319,8 @@ ensure_script_is_permanent() {
     local script_dir
     script_dir=$(dirname "$SCRIPT_PATH")
     
-    log "Listing permissions for /usr/local:"
-    ls -ld "/usr/local" | tee -a "$LOG_FILE"
+    log "Listing permissions for /Users/Shared:"
+    ls -ld "/Users/Shared" | tee -a "$LOG_FILE"
 
     if [[ ! -d "$script_dir" ]]; then
         log "Creating directory: $script_dir"
