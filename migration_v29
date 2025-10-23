@@ -308,40 +308,70 @@ Please double-check that OneDrive has finished syncing all your important files.
 }
 
 ensure_script_is_permanent() {
+    # Enable verbose debugging JUST for this function
+    set -x
+    
     log "Ensuring script is in a permanent location..."
+    log "Running as user: $(whoami)"
     log "Script is currently running from: $0"
     log "Script's permanent path will be: $SCRIPT_PATH"
     
     local script_dir
     script_dir=$(dirname "$SCRIPT_PATH")
     
-    # This directory is also used by the plist, but we ensure it exists here.
+    log "Listing permissions for /Library/Application Support:"
+    ls -ld "/Library/Application Support" | tee -a "$LOG_FILE"
+
     if [[ ! -d "$script_dir" ]]; then
         log "Creating directory: $script_dir"
         mkdir -p "$script_dir"
         if [[ $? -ne 0 ]]; then
+            # Disable debugging before erroring
+            set +x
             err "ensure_script_is_permanent" "Failed to create script directory at $script_dir. Deferral will not work."
         fi
-        log "Directory created."
+        log "Directory created. Setting permissions."
+        chmod 755 "$script_dir"
     else
         log "Directory $script_dir already exists."
     fi
     
-    # Use 'cat' and redirection instead of 'cp'.
-    # This is more robust for scripts running from temp locations.
-    log "Attempting to write script content to $SCRIPT_PATH..."
-    cat "$0" > "$SCRIPT_PATH"
+    log "Listing permissions for $script_dir:"
+    ls -ld "$script_dir" | tee -a "$LOG_FILE"
+
+    log "Attempting to create and write script to $SCRIPT_PATH..."
     
+    # 1. Create/touch the file first
+    touch "$SCRIPT_PATH"
+    if [[ $? -ne 0 ]]; then
+         # Disable debugging before erroring
+         set +x
+         err "ensure_script_is_permanent" "Failed to 'touch' (create) script file at $SCRIPT_PATH. Check permissions."
+    fi
+    
+    # 2. Set permissions on the empty file
+    chmod 644 "$SCRIPT_PATH"
+    
+    # 3. Write content to the file
+    cat "$0" > "$SCRIPT_PATH"
     local cat_exit_code=$?
     
     if [[ $cat_exit_code -ne 0 ]]; then
         log "[ERROR] 'cat' command failed with exit code $cat_exit_code."
-        err "ensure_script_is_permanent" "Failed to copy script to $SCRIPT_PATH. Deferral will not work."
+        # Disable debugging before erroring
+        set +x
+        err "ensure_script_is_permanent" "Failed to write script content to $SCRIPT_PATH. Deferral will not work."
     fi
     
-    log "Copy successful. Setting permissions..."
-    chmod +x "$SCRIPT_PATH"
+    # 4. Make it executable
+    log "Write successful. Setting final permissions..."
+    chmod 755 "$SCRIPT_PATH"
+    chown root:wheel "$SCRIPT_PATH"
+    
     log "Script is now located at $SCRIPT_PATH"
+    
+    # Disable verbose debugging
+    set +x
 }
 
 
@@ -650,3 +680,8 @@ This action cannot be undone." \
 }
 
 main "$@"
+
+
+
+
+
