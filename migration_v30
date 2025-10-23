@@ -180,10 +180,9 @@ handle_deferral() {
         --width 450
         --height 250
         --messagefont "size=12"
-        # CRITICAL FIX: The syntax of the value string itself is now correct.
-        # title="Deferral Options" is now quoted.
-        --select 
-        'title="Deferral Options",values="Start of Day (9am)","Lunch (12pm)","End of Day (5pm)","1 hour","2 hours","4 hours",default="1 hour"'
+        # CRITICAL FIX: Pass the --select and its value as a single
+        # array element using the --flag=value syntax.
+        --select=title="Deferral Options",values="Start of Day (9am)","Lunch (12pm)","End of Day (5pm)","1 hour","2 hours","4 hours",default="1 hour"
         --button1text "Confirm Deferral"
     )
     
