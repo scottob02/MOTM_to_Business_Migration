@@ -7,13 +7,15 @@
 # --- Deferral Settings ---
 MAX_DEFERRALS=5
 LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
+# Deferral files now live in the user's Library
 PLIST_PATH="/Users/$LOGGED_IN_USER/Library/Application Support/LBG/com.lbg.jamf-migration.plist"
 LAUNCH_AGENT_PATH="/Users/$LOGGED_IN_USER/Library/LaunchAgents/com.lbg.jamf-migration.plist"
-# SCRIPT_PATH is no longer needed and has been removed.
 
 
-# --- SwiftDialog Settings ---
+# --- SwiftDialog & Notifier Settings ---
 DIALOG_BINARY="/usr/local/bin/dialog"
+NOTIFIER_APP_PATH="/Applications/IBM Notifier.app" # Path to the .app
+NOTIFIER_BINARY="$NOTIFIER_APP_PATH/Contents/MacOS/IBM Notifier" # Path to the executable
 BRANDING_ICON="/Users/Shared/LBG_Branding_Cancara/lbg_primary_logo.png" 
 
 # --- Jamf API Credentials & Endpoints ---
@@ -22,7 +24,7 @@ JAMF_CLIENT_SECRET="${5:-$JAMF_CLIENT_SECRET}"
 ORIGIN_JAMF_URL="${6:-$ORIGIN_JAMF_URL}"
 TARGET_JAMF_URL="${7:-$TARGET_JAMF_URL}"
 DRY_RUN="${8:-${DRY_RUN:-false}}"
-JAMF_POLICY_ID="${9:-$JAMF_POLICY_ID}"
+JAMF_POLICY_ID="${9:-$JAMF_POLICY_ID}" # e.g., "123"
 
 # --- Global Variables ---
 management_id=""
@@ -45,12 +47,18 @@ success() {
     "$GREEN" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" | tee -a "$LOG_FILE"
 }
 
+# Updated err function to take $1=function_name and $2=message
 err() {
-  local caller="$1"
+  local function_name="$1"
   local message="$2"
   printf '%b[%s] [ERROR] [%s] %s%b\n' \
-    "$RED" "$(date '+%Y-%m-%dT%H:%M:%S')" "$caller" "$message" "$NC" | tee -a "$LOG_FILE" >&2
-  show_dialog_error "[$caller] $message"
+    "$RED" "$(date '+%Y-%m-%dT%H:%M:%S')" "$function_name" "$message" "$NC" | tee -a "$LOG_FILE" >&2
+  # Only show dialog if swiftDialog is available
+  if [ -x "$DIALOG_BINARY" ]; then
+    "$DIALOG_BINARY" --title "Migration Error" --message "An error occurred in $function_name:\n\n$message" \
+      --icon "SF=xmark.octagon.fill,colour=red" \
+      --button1text "Close" --width 450 --height 250 --messagefont "size=12"
+  fi
   exit 1
 }
 
@@ -84,6 +92,7 @@ urlencode() {
 # ─── SWIFTDIALOG FUNCTIONS ────────────────────────────────────────────────────
 #
 
+# These dialogs are simple and work, so we keep swiftDialog for them.
 show_dialog_error() {
   "$DIALOG_BINARY" --title "Migration Error" --message "$1" --icon "SF=xmark.octagon.fill,colour=red" \
     --button1text "Close" --width 450 --height 250 --messagefont "size=12"
@@ -111,12 +120,16 @@ schedule_relaunch() {
     
     log "Scheduling relaunch for Hour: $hour, Minute: $minute"
     
+    # Ensure the user's LaunchAgents directory exists
+    mkdir -p "$(dirname "$LAUNCH_AGENT_PATH")"
+    
     # Unload any existing agent to ensure we are setting a new schedule
     if [ -f "$LAUNCH_AGENT_PATH" ]; then
         launchctl bootout "gui/$(id -u "$LOGGED_IN_USER")" "$LAUNCH_AGENT_PATH" &>/dev/null
     fi
 
     # Create the launch agent plist
+    # This will run the Jamf Policy by its ID, which is the robust method.
     cat << EOF > "$LAUNCH_AGENT_PATH"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -144,11 +157,11 @@ schedule_relaunch() {
 </plist>
 EOF
 
-    # Set correct ownership and permissions
+    # Set correct ownership for the user
     chown "$LOGGED_IN_USER" "$LAUNCH_AGENT_PATH"
     chmod 644 "$LAUNCH_AGENT_PATH"
 
-    # Load the new agent
+    # Load the new agent as the user
     launchctl bootstrap "gui/$(id -u "$LOGGED_IN_USER")" "$LAUNCH_AGENT_PATH"
     log "Launch Agent loaded and scheduled to run policy $JAMF_POLICY_ID."
 }
@@ -171,14 +184,12 @@ handle_deferral() {
     current_hour=$(date +%H)
     
     # ---
-    # --- THIS IS THE FINAL, ROBUST FIX ---
+    # --- NEW SOLUTION using IBM Notifier ---
     # ---
-    # We will build the command in a zsh array. This is the
-    # *only* reliable way to pass arguments with spaces and
-    # special characters to another command. This completely
-    # avoids all the quoting issues we have been fighting.
+    # This avoids all swiftDialog quoting issues by using
+    # IBM Notifier's JSON-based dropdown.
 
-    # 1. Define the options in an array.
+    # 1. Define the options in a zsh array.
     local -a defer_options=(
         "Start of Day (9am)"
         "Lunch (12pm)"
@@ -188,32 +199,40 @@ handle_deferral() {
         "4 hours"
     )
 
-    # 2. Build the full swiftDialog command in an array.
-    #    We use --select and --values (separate flags), which is a
-    #    robust syntax that accepts arrays.
-    local -a dialog_cmd=(
-        "$DIALOG_BINARY"
-        --title "Choose Deferral Time"
-        --message "When should we remind you? This prompt will reappear at the time you select."
-        --icon "$BRANDING_ICON"
-        --width 450
-        --height 250
-        --messagefont "size=12"
-        --select "title=Deferral Options, required"
-        --values "${defer_options[@]}"
-        --default "1 hour"
-        --button1text "Confirm Deferral"
-        --button2text "Cancel"
+    # 2. Build the JSON payload for the dropdown.
+    #    We use jq to safely build the JSON string.
+    local json_payload
+    json_payload=$(jq -n --argjson options "$(printf '%s\n' "${defer_options[@]}" | jq -R . | jq -s .)" \
+                   '{ "options": $options, "default_selection": "1 hour" }')
+    
+    if [[ -z "$json_payload" ]]; then
+        err "handle_deferral" "Failed to create JSON payload for IBM Notifier."
+    fi
+
+    # 3. Build the IBM Notifier command as a zsh array
+    local -a notifier_cmd=(
+        "$NOTIFIER_BINARY"
+        -type "popup"
+        -title "Choose Deferral Time"
+        -subtitle "When should we remind you? This prompt will reappear at the time you select."
+        -icon_path "$BRANDING_ICON"
+        -accessory_view_type "dropdown"
+        -accessory_view_payload "$json_payload"
+        -button_1_text "Confirm Deferral"
+        -button_2_text "Cancel"
+        -position "center"
+        -always_on_top
     )
     
-    # 3. Execute the command and capture the output.
-    defer_choice=$("${dialog_cmd[@]}")
+    # 4. Execute the command and capture the JSON output.
+    local notifier_output
+    notifier_output=$("${notifier_cmd[@]}")
     local exit_code=$?
-    
-    # DEBUG line to see what swiftDialog is *actually* outputting
-    log "DEBUG: User selected deferral choice: '$defer_choice' (Exit code: $exit_code)"
 
-    # If user clicks "Cancel" (button 2), exit the script.
+    log "DEBUG: IBM Notifier output: '$notifier_output' (Exit code: $exit_code)"
+
+    # 5. Parse the output.
+    #    Button 2 (Cancel) has exit code 2.
     if [[ $exit_code -eq 2 ]]; then
         log "User cancelled deferral selection."
         # We must exit 0 because a deferral *did* happen,
@@ -221,7 +240,19 @@ handle_deferral() {
         exit 0
     fi
     
-    # The case statement already matches the full strings, so it's correct.
+    #    Button 1 (Confirm) has exit code 0.
+    #    We parse the selected option from the JSON.
+    local defer_choice
+    defer_choice=$(echo "$notifier_output" | jq -r .selected_option)
+
+    if [[ -z "$defer_choice" || "$defer_choice" == "null" ]]; then
+        log "ERROR: Could not parse deferral choice from IBM Notifier. Defaulting to 1 hour."
+        defer_choice="1 hour"
+    fi
+
+    log "User selected deferral choice: '$defer_choice'"
+    
+    # 6. The case statement logic remains identical.
     case "$defer_choice" in
         'Start of Day (9am)')
             future_hour=9
@@ -272,6 +303,7 @@ handle_deferral() {
             log "User chose to defer for 4 hours."
             ;;
         *)
+            # This is our fallback
             log "ERROR: Deferral choice '$defer_choice' (Exit: $exit_code) did not match. Defaulting to 1 hour."
             future_hour=$(date -v+1H +%H)
             future_minute=$(date -v+1H +%M)
@@ -280,24 +312,23 @@ handle_deferral() {
     esac
 
     schedule_relaunch "$future_hour" "$future_minute"
-    show_dialog_info "Migration Deferred" "You will be reminded $friendly_time."
     
-    # We must also chown the plist, as this function may create it
-    chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
+    # Show final confirmation
+    show_dialog_info "Migration Deferred" "The migration has been deferred. You will be reminded $friendly_time."
     
+    # Exit after deferral is set
     exit 0
 }
 
+
 check_deferral() {
+  # Ensure the directory for the plist exists
+  mkdir -p "$(dirname "$PLIST_PATH")"
+  chown "$LOGGED_IN_USER" "$(dirname "$PLIST_PATH")"
+  
   if [ ! -f "$PLIST_PATH" ]; then
     log "Plist not found. Creating with 0 deferrals."
-    local plist_dir
-    plist_dir=$(dirname "$PLIST_PATH")
-    mkdir -p "$plist_dir"
-    # Set ownership of the new directory to the user
-    chown -R "$LOGGED_IN_USER" "$plist_dir"
     defaults write "$PLIST_PATH" DeferralCount -int 0
-    # Set ownership of the new plist to the user
     chown "$LOGGED_IN_USER" "$PLIST_PATH"
   fi
   
@@ -310,7 +341,7 @@ check_deferral() {
     show_dialog_info "Mandatory Migration" "The migration is now mandatory and the process will begin automatically."
     remove_relaunch_agent # Clean up scheduler as it's no longer needed
   else
-    if show_dialog_confirm "StratMac to LBG Business Migration" "This Mac is now due to migrate over to the new LBG Business build for Apple Mac devices.\n\n The entire process will take roughly 1 hour depending on your internet speed.\n\n You have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
+    if show_dialog_confirm "StratMac to LBG Business Migration" "This Mac is now due to migrate over to new LBG Business build for Apple Mac devices.\n\n The entire process will take roughly 1 hour depending on your internet speed.\n\n You have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
         log "User chose to migrate."
         remove_relaunch_agent # Clean up scheduler
     else
@@ -320,13 +351,11 @@ check_deferral() {
 }
 
 show_requirements_dialog() {
-    # This is the dialog from migration_v22
     local message
     message="To ensure a smooth migration to LBG Business, please verify the following requirements before you continue:\n\n"
-    message+="* **Power:** Your Mac must be connected to a power source.\n"
-    message+="* **Internet:** A stable internet connection throughout the entire migration is required.\n"
-    message+="* **Data Backed-up:** Any information, files, or notes you wish to keep must be saved and uploaded to OneDrive. Anything not stored in OneDrive will be permanetly deleted. \n\n"
-    message+="Additionally this process will close all open applications and then perform a factory reset which will wipe all data from this Mac."
+    message+="* **Power:** Your Mac must be connected to a power adapter.\n"
+    message+="* **Internet:** A stable internet connection is required.\n\n"
+    message+="This process will close all open applications and then completely wipe all data from this Mac. Ensure your data is backed up before proceeding."
 
     if ! show_dialog_confirm "Migration Requirements" "$message" "I Understand, Continue" "Cancel"; then
         log "User cancelled at the requirements screen."
@@ -335,31 +364,17 @@ show_requirements_dialog() {
 }
 
 show_data_backup_dialog() {
-    # This is the new, explicit data warning dialog
     local message
-    message="**FINAL DATA WARNING**
+    message="**FINAL DATA WARNING**\n\nThis process will **PERMANENTLY ERASE** all data on this Mac.
+    \n\n- All applications, files, and settings will be deleted.
+    - The Mac will be reset to factory settings.
+    \n\nBefore proceeding, you **MUST** ensure all important files (documents, pictures, notes, etc.) are saved and fully synced to **OneDrive**.
+    \n\n**Data not saved to OneDrive will be lost forever.**"
 
-This is your final confirmation that **all data on this Mac will be permanently erased.**
-
-- This action **cannot be undone**.
-- Only files you have saved and **fully synced to OneDrive** will be available after the migration.
-
-Please double-check that OneDrive has finished syncing all your important files."
-
-    if ! "$DIALOG_BINARY" --title "Have You Synced All Your Data?" \
-        --message "$message" \
-        --icon "SF=exclamationmark.triangle.fill,colour=red" \
-        --button1text "I confirm I have synced everything I need" \
-        --button2text "Cancel" \
-        --width 650 --height 350 --messagefont "size=14"; then
-        log "User cancelled at the final data backup warning screen."
+    if ! show_dialog_confirm "Data Deletion Confirmation" "$message" "I Confirm My Data is Backed Up" "Cancel"; then
+        log "User cancelled at the final data backup warning."
         exit 0
     fi
-    success "User has explicitly confirmed data backup and accepts erasure."
-}
-
-ensure_script_is_permanent() {
-    # This function is no longer needed and has been removed.
 }
 
 
@@ -382,6 +397,59 @@ setup_environment() {
       err "setup_environment" "$error_msg"
     fi
 
+    # --- Install JQ (if missing) ---
+    # This must be installed *before* we check for it
+    if ! command -v jq &> /dev/null; then
+        log "jq not found. Downloading for Apple Silicon..."
+        # We know this is Apple Silicon because check_hardware_support() ran first in main()
+        curl -L -s "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64" -o "/usr/local/bin/jq"
+        if [[ $? -ne 0 ]]; then
+            err "setup_environment" "Failed to download jq. This is required for deferrals."
+        fi
+        chmod +x "/usr/local/bin/jq"
+        log "jq installed successfully."
+    else
+        log "jq is already installed."
+    fi
+
+    # --- Install IBM Notifier (if missing) ---
+    # This must be installed *before* we check for it
+    if [ ! -d "$NOTIFIER_APP_PATH" ]; then
+        log "IBM Notifier not found. Downloading..."
+        local notifier_pkg="/tmp/IBM-Notifier.pkg"
+        # Use -L to follow redirects, -s for silent, -o for output file
+        curl -L -s "https://github.com/ibm/mac-ibm-notifications/releases/latest/download/IBM-Notifier.pkg" -o "$notifier_pkg"
+        if [[ $? -ne 0 ]]; then
+            err "setup_environment" "Failed to download IBM Notifier package."
+        fi
+        
+        log "Installing IBM Notifier..."
+        installer -pkg "$notifier_pkg" -target /
+        if [[ $? -ne 0 ]]; then
+            err "setup_environment" "Failed to install IBM Notifier. This is required for deferrals."
+        fi
+        rm "$notifier_pkg"
+        log "IBM Notifier installed successfully."
+    else
+        log "IBM Notifier is already installed."
+    fi
+
+
+    # Check for all our required binaries (now as verification)
+    if [ ! -x "$DIALOG_BINARY" ]; then
+        # This is a fatal error, but we can't show a dialog if dialog isn't there.
+        # Log to stderr, which Jamf will pick up.
+        echo "FATAL: swiftDialog not found at $DIALOG_BINARY. This is required." >&2
+        exit 1
+    fi
+    if [ ! -x "$NOTIFIER_BINARY" ]; then
+        err "setup_environment" "IBM Notifier verification failed. Binary not found at '$NOTIFIER_BINARY'."
+    fi
+    if ! command -v jq &> /dev/null; then
+        err "setup_environment" "jq verification failed. This is required for deferrals."
+    fi
+
+
     client_id="$JAMF_CLIENT_ID"
     client_secret="$JAMF_CLIENT_SECRET"
     origin_jamf_url="${ORIGIN_JAMF_URL%/}"
@@ -391,14 +459,15 @@ setup_environment() {
 
     log_dir=$(dirname "$LOG_FILE")
     mkdir -p "$log_dir" 2>/dev/null
+    chown "$LOGGED_IN_USER" "$log_dir"
     touch "$LOG_FILE" 2>/dev/null
+    chown "$LOGGED_IN_USER" "$LOG_FILE"
     
     serial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
     [ -z "$serial" ] && err "setup_environment" "Could not determine serial number."
 }
 
 check_hardware_support() {
-    # This check is critical
     log "Checking hardware for Apple Silicon..."
     if ! sysctl -n machdep.cpu.brand_string | grep -q "Apple"; then
         err "check_hardware_support" "This device is not an Apple Silicon Mac and is no longer supported. Please follow the process to order a new device."
@@ -422,53 +491,52 @@ check_os_version() {
 get_connection_type() {
   log "Determining active network service…"
   if ! curl -s --head --connect-timeout 5 "https://www.google.co.uk/" >/dev/null 2>&1; then
-      err "get_connection_type" "No internet connectivity detected. Migration requires an active internet connection."
-  else
-    success "Internet connectivity check passed."
+    err "get_connection_type" "No internet connectivity detected. Migration requires an active internet connection."
   fi
+  success "Internet connectivity check passed."
 }
 
 check_device_power_type() {
   log "Checking power source..."
   if ! pmset -g batt | grep -q "AC Power"; then
-      err "check_device_power_type" "Device is not connected to AC power. Please connect your power adapter to continue."
-  else
-    success "Device is connected to AC power."
+    err "check_device_power_type" "Device is not connected to AC power. Please connect your power adapter to continue."
   fi
+  success "Device is connected to AC power."
 }
 
 check_mdm_profile() {
   log "Checking for active MDM profile..."
   if ! profiles status -type enrollment | grep -q "Enrolled via DEP:"; then
-      err "check_mdm_profile" "No active MDM profile was detected. This device must be enrolled in MDM to proceed."
-  else
-    success "Active MDM profile detected."
+    err "check_mdm_profile" "No active MDM profile was detected. This device must be enrolled in MDM to proceed."
   fi
+  success "Active MDM profile detected."
 }
 
 check_jamf_enrollment() {
   log "Verifying current Jamf Pro enrollment status..."
   if [[ ! -f "/usr/local/jamf/bin/jamf" ]]; then
-      err "check_jamf_enrollment" "Jamf binary not found - device not enrolled in any Jamf Pro instance."
+    err "check_jamf_enrollment" "Jamf binary not found - device not enrolled in any Jamf Pro instance."
+  fi
+  
+  local current_jss_url
+  current_jss_url=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)
+  
+  if [[ "$current_jss_url" == "$target_jamf_url"* ]]; then
+    err "check_jamf_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
+  elif [[ "$current_jss_url" != "$origin_jamf_url"* ]]; then
+    log "WARN: Device is enrolled in neither the origin nor target Jamf instance. Current: $current_jss_url"
   else
-    local current_jss_url
-    current_jss_url=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)
-    
-    if [[ "$current_jss_url" == "$target_jamf_url"* ]]; then
-      err "check_jss_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
-    elif [[ "$current_jss_url" != "$origin_jamf_url"* ]]; then
-      log "WARN: Device is enrolled in neither the origin nor target Jamf instance. Current: $current_jss_url"
-    else
-      success "Confirmed device is enrolled in origin Jamf instance."
-    fi
+    success "Confirmed device is enrolled in origin Jamf instance."
   fi
 }
 
 kill_user_apps() {
-  local excluded_patterns=("Self Service" "Terminal" "Finder" "dialog" "jamf" "Jamf" "Symantec" "WSS")
+  # Added "Symantec" and "WSS" to the exclusion list
+  local excluded_patterns=("Self Service" "Terminal" "Finder" "dialog" "jamf" "Jamf" "IBM Notifier" "Symantec" "WSS")
   log "Starting graceful application termination..."
   
   local app_pids=()
+  # Using ps as the user to find their apps
   ps -ax -o pid,command | grep "/Applications/.*\.app/" | grep -v grep | while read -r pid command; do
     local app_name
     app_name=$(echo "$command" | sed -E 's|.*/Applications/([^/]+)\.app/.*|\1|')
@@ -496,15 +564,14 @@ kill_user_apps() {
   done
 }
 
-check_apns_connectivity() {
+check_apns_ connectivity() {
   log "Checking connectivity to Apple Push Notification Service (APNs)..."
   if nc -z -G 3 api.push.apple.com 443; then
     success "APNs hostname (api.push.apple.com) is reachable on port 443."
   else
-      err "check_apns_connectivity" "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail."
+    err "check_apns_connectivity" "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail."
   fi
 }
-
 
 #
 # ─── JAMF PRO API FUNCTIONS ───────────────────────────────────────────────────
@@ -565,7 +632,7 @@ clear_failed_commands() {
     success "Successfully cleared failed/pending commands (HTTP $http_status)."
   else
     # This is not a critical failure, so just log a warning.
-    log "WARN: Could not clear failed commands (HTTP $http_Astatus). This is non-critical, proceeding anyway."
+    log "WARN: Could not clear failed commands (HTTP $http_status). This is non-critical, proceeding anyway."
   fi
 }
 
@@ -614,18 +681,17 @@ trigger_remote_wipe() {
 #
 
 main() {
-  # --- Initial Setup & Critical Checks ---
-  setup_environment
-  # ensure_script_is_permanent has been removed
+  # Hardware check MUST come first, as it determines which jq binary to download
   check_hardware_support
+  
+  # Setup will now install missing dependencies
+  setup_environment
+  
   check_deferral
-
-  # --- User Dialogs ---
   show_requirements_dialog
-  show_data_backup_dialog
+  show_data_backup_dialog # Added explicit data warning
 
   # --- Run all preflight checks ---
-  log "Starting pre-flight checks..."
   check_os_version
   check_device_power_type
   get_connection_type
@@ -633,7 +699,7 @@ main() {
   check_jamf_enrollment
   check_mdm_profile
   
-  log "All pre-flight checks passed."
+  log "All preflight checks passed."
 
   # --- Get Jamf Info ---
   get_jamf_auth_token
@@ -641,6 +707,7 @@ main() {
   clear_failed_commands
 
   # --- Final Warning & App Kill ---
+  # Using a more impactful warning dialog
   if ! "$DIALOG_BINARY" --title "⚠️ POINT OF NO RETURN" \
     --message "This is your final confirmation.
 
@@ -648,13 +715,13 @@ Clicking the button below will immediately:
 1. Close all running applications.
 2. Send the command to **permanently erase all data** from this Mac.
 
-This action cannot be undone." \
+This action cannot be undone. Ensure your data is in OneDrive." \
     --icon "SF=exclamationmark.triangle.fill,colour=orange" \
-    --button1text "I understand, Migrate to LBG Business" \
+    --button1text "I Understand, ERASE THIS MAC" \
     --button2text "Cancel" \
     --width 600 --height 350 --messagefont "size=14"; then
-    log "User cancelled at final warning."
-    exit 0
+      log "User cancelled at final warning."
+      exit 0
   fi
   
   kill_user_apps
