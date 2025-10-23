@@ -45,9 +45,11 @@ success() {
 }
 
 err() {
-  printf '%b[%s] [ERROR] %s%b\n' \
-    "$RED" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" | tee -a "$LOG_FILE" >&2
-  show_dialog_error "$1"
+  local caller="$1"
+  local message="$2"
+  printf '%b[%s] [ERROR] [%s] %s%b\n' \
+    "$RED" "$(date '+%Y-%m-%dT%H:%M:%S')" "$caller" "$message" "$NC" | tee -a "$LOG_FILE" >&2
+  show_dialog_error "[$caller] $message"
   exit 1
 }
 
@@ -306,9 +308,6 @@ Please double-check that OneDrive has finished syncing all your important files.
 }
 
 ensure_script_is_permanent() {
-    # Enable verbose debugging for this function
-    set -x
-
     log "Ensuring script is in a permanent location..."
     log "Script is currently running from: $0"
     log "Script's permanent path will be: $SCRIPT_PATH"
@@ -321,41 +320,28 @@ ensure_script_is_permanent() {
         log "Creating directory: $script_dir"
         mkdir -p "$script_dir"
         if [[ $? -ne 0 ]]; then
-            # Disable debugging before exiting
-            set +x
-            err "Failed to create script directory at $script_dir. Deferral will not work."
+            err "ensure_script_is_permanent" "Failed to create script directory at $script_dir. Deferral will not work."
         fi
         log "Directory created."
     else
         log "Directory $script_dir already exists."
     fi
     
-    log "Listing permissions for source file ($0):"
-    ls -l "$0" | tee -a "$LOG_FILE"
+    # Use 'cat' and redirection instead of 'cp'.
+    # This is more robust for scripts running from temp locations.
+    log "Attempting to write script content to $SCRIPT_PATH..."
+    cat "$0" > "$SCRIPT_PATH"
     
-    log "Listing permissions for destination directory ($script_dir):"
-    ls -ld "$script_dir" | tee -a "$LOG_FILE"
+    local cat_exit_code=$?
     
-    # Copy the currently running script ($0) to the permanent path
-    # Use -f to force overwrite if it already exists
-    log "Attempting to copy $0 to $SCRIPT_PATH..."
-    cp -f "$0" "$SCRIPT_PATH"
-    
-    local cp_exit_code=$?
-    
-    if [[ $cp_exit_code -ne 0 ]]; then
-        log "[ERROR] cp command failed with exit code $cp_exit_code."
-        # Disable debugging before exiting
-        set +x
-        err "Failed to copy script to $SCRIPT_PATH. Deferral will not work."
+    if [[ $cat_exit_code -ne 0 ]]; then
+        log "[ERROR] 'cat' command failed with exit code $cat_exit_code."
+        err "ensure_script_is_permanent" "Failed to copy script to $SCRIPT_PATH. Deferral will not work."
     fi
     
     log "Copy successful. Setting permissions..."
     chmod +x "$SCRIPT_PATH"
     log "Script is now located at $SCRIPT_PATH"
-    
-    # Disable verbose debugging
-    set +x
 }
 
 
@@ -374,7 +360,7 @@ setup_environment() {
     if [ -z "$TARGET_JAMF_URL" ]; then error_msg+="\n- TARGET_JAMF_URL"; missing_params=true; fi
 
     if $missing_params; then
-      err "$error_msg"
+      err "setup_environment" "$error_msg"
     fi
 
     client_id="$JAMF_CLIENT_ID"
@@ -389,14 +375,14 @@ setup_environment() {
     touch "$LOG_FILE" 2>/dev/null
     
     serial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
-    [ -z "$serial" ] && err "Could not determine serial number."
+    [ -z "$serial" ] && err "setup_environment" "Could not determine serial number."
 }
 
 check_hardware_support() {
     # This check is critical
     log "Checking hardware for Apple Silicon..."
     if ! sysctl -n machdep.cpu.brand_string | grep -q "Apple"; then
-        err "This device is not an Apple Silicon Mac and is no longer supported. Please follow the process to order a new device."
+        err "check_hardware_support" "This device is not an Apple Silicon Mac and is no longer supported. Please follow the process to order a new device."
     fi
     success "Apple Silicon Mac detected. Device is supported."
 }
@@ -408,7 +394,7 @@ check_os_version() {
     os_major_version=$(echo "$OS_VERSION" | awk -F. '{print $1}')
 
     if [[ "$os_major_version" -lt 12 ]]; then
-        err "macOS version ($OS_VERSION) is older than macOS 12. Local 'Erase All Content and Settings' is not supported."
+        err "check_os_version" "macOS version ($OS_VERSION) is older than macOS 12. Local 'Erase All Content and Settings' is not supported."
     else
         success "macOS version ($OS_VERSION) supports local erase."
     fi
@@ -417,7 +403,7 @@ check_os_version() {
 get_connection_type() {
   log "Determining active network service…"
   if ! curl -s --head --connect-timeout 5 "https://www.google.co.uk/" >/dev/null 2>&1; then
-      err "No internet connectivity detected. Migration requires an active internet connection."
+      err "get_connection_type" "No internet connectivity detected. Migration requires an active internet connection."
   else
     success "Internet connectivity check passed."
   fi
@@ -426,7 +412,7 @@ get_connection_type() {
 check_device_power_type() {
   log "Checking power source..."
   if ! pmset -g batt | grep -q "AC Power"; then
-      err "Device is not connected to AC power. Please connect your power adapter to continue."
+      err "check_device_power_type" "Device is not connected to AC power. Please connect your power adapter to continue."
   else
     success "Device is connected to AC power."
   fi
@@ -435,7 +421,7 @@ check_device_power_type() {
 check_mdm_profile() {
   log "Checking for active MDM profile..."
   if ! profiles status -type enrollment | grep -q "Enrolled via DEP:"; then
-      err "No active MDM profile was detected. This device must be enrolled in MDM to proceed."
+      err "check_mdm_profile" "No active MDM profile was detected. This device must be enrolled in MDM to proceed."
   else
     success "Active MDM profile detected."
   fi
@@ -444,13 +430,13 @@ check_mdm_profile() {
 check_jamf_enrollment() {
   log "Verifying current Jamf Pro enrollment status..."
   if [[ ! -f "/usr/local/jamf/bin/jamf" ]]; then
-      err "Jamf binary not found - device not enrolled in any Jamf Pro instance."
+      err "check_jamf_enrollment" "Jamf binary not found - device not enrolled in any Jamf Pro instance."
   else
     local current_jss_url
     current_jss_url=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)
     
     if [[ "$current_jss_url" == "$target_jamf_url"* ]]; then
-      err "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
+      err "check_jamf_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
     elif [[ "$current_jss_url" != "$origin_jamf_url"* ]]; then
       log "WARN: Device is enrolled in neither the origin nor target Jamf instance. Current: $current_jss_url"
     else
@@ -496,7 +482,7 @@ check_apns_connectivity() {
   if nc -z -G 3 api.push.apple.com 443; then
     success "APNs hostname (api.push.apple.com) is reachable on port 443."
   else
-      err "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail."
+      err "check_apns_connectivity" "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail."
   fi
 }
 
@@ -514,7 +500,7 @@ get_jamf_auth_token() {
       -d "grant_type=client_credentials&client_id=$client_id&client_secret=$client_secret"
   )
   bearer_token=$(echo "$response" | jq -r '.access_token')
-  [[ -z "$bearer_token" || "$bearer_token" == "null" ]] && err "Failed to get API token from Jamf Pro."
+  [[ -z "$bearer_token" || "$bearer_token" == "null" ]] && err "get_jamf_auth_token" "Failed to get API token from Jamf Pro."
   success "API token obtained successfully."
 }
 
@@ -532,14 +518,14 @@ get_computer_inventory_id() {
     response_body=$(echo "$response" | sed '$d')
 
     if [[ "$http_status" -ne 200 ]]; then
-        err "Jamf API request failed with HTTP status $http_status."
+        err "get_computer_inventory_id" "Jamf API request failed with HTTP status $http_status."
     fi
 
     computer_id=$(echo "$response_body" | jq -r '.results[0].id')
     management_id=$(echo "$response_body" | jq -r '.results[0].general.managementId')
     
-    [[ -z "$computer_id" || "$computer_id" == "null" ]] && err "Computer ID not found in Jamf Pro API response."
-    [[ -z "$management_id" || "$management_id" == "null" ]] && err "Management ID not found in Jamf Pro API response."
+    [[ -z "$computer_id" || "$computer_id" == "null" ]] && err "get_computer_inventory_id" "Computer ID not found in Jamf Pro API response."
+    [[ -z "$management_id" || "$management_id" == "null" ]] && err "get_computer_inventory_id" "Management ID not found in Jamf Pro API response."
 
     success "Found Computer ID: $computer_id and Management ID: $management_id"
 }
@@ -599,7 +585,7 @@ trigger_remote_wipe() {
         success "EraseDevice command sent successfully (HTTP $http_status)."
         exit 0
     else
-        err "Failed to send EraseDevice command. HTTP status: $http_status"
+        err "trigger_remote_wipe" "Failed to send EraseDevice command. HTTP status: $http_status"
     fi
 }
 
@@ -664,6 +650,3 @@ This action cannot be undone." \
 }
 
 main "$@"
-
-
-
