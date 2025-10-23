@@ -170,35 +170,42 @@ handle_deferral() {
     local current_hour
     current_hour=$(date +%H)
     
-    # --- Robust Argument Building using a zsh Array ---
-    # This is the correct, modern way to pass complex arguments.
-    local -a dialog_args
-    dialog_args=(
-        --title "Choose Deferral Time"
-        --message "When should we remind you? This prompt will reappear at the time you select."
-        --icon "$BRANDING_ICON"
-        --width 450
-        --height 250
-        --messagefont "size=12"
-        # CRITICAL FIX: Pass the --select and its value as a single
-        # array element using the --flag=value syntax.
-        --select=title="Deferral Options",values="Start of Day (9am)","Lunch (12pm)","End of Day (5pm)","1 hour","2 hours","4 hours",default="1 hour"
-        --button1text "Confirm Deferral"
-    )
+    # --- NEW SOLUTION: Use separate buttons ---
+    # This avoids all quoting issues with the --select flag.
+    # We use button1text for the first option, extrabutton for the rest,
+    # and button2text for the "Cancel" option.
+    defer_choice=$("$DIALOG_BINARY" \
+        --title "Choose Deferral Time" \
+        --message "When should we remind you? This prompt will reappear at the time you select." \
+        --icon "$BRANDING_ICON" \
+        --width 450 \
+        --height 300 \
+        --messagefont "size=12" \
+        --button1text "Start of Day (9am)" \
+        --extrabutton "Lunch (12pm)" \
+        --extrabutton "End of Day (5pm)" \
+        --extrabutton "1 hour" \
+        --extrabutton "2 hours" \
+        --extrabutton "4 hours" \
+        --button2text "Cancel")
     
-    # Execute the command by expanding the array.
-    # The shell will now pass each argument correctly.
-    defer_choice=$("$DIALOG_BINARY" "${dialog_args[@]}")
+    local exit_code=$?
     
-    # Exit if user hits Cancel (returns non-zero)
-    [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
+    # Exit if user hits Cancel (exit code 2)
+    if [[ $exit_code -eq 2 ]]; then
+        log "User cancelled deferral selection."
+        # We must exit 0 because a deferral *did* happen,
+        # and we don't want the script to continue to the wipe.
+        exit 0
+    fi
     
     # DEBUG line to see what swiftDialog is *actually* outputting
-    log "DEBUG: User selected deferral choice: '$defer_choice'"
+    log "DEBUG: User selected deferral choice: '$defer_choice' (Exit code: $exit_code)"
     
-    # Reordered case statement to match the new list and *include the DOUBLE quotes*
+    # Reordered case statement to match the button text
+    # No quotes are needed here because the output is clean.
     case "$defer_choice" in
-        '"Start of Day (9am)"')
+        'Start of Day (9am)')
             future_hour=9
             future_minute=0
             if [[ "$current_hour" -lt 9 ]]; then
@@ -208,7 +215,7 @@ handle_deferral() {
             fi
             log "User chose to defer until 9 AM."
             ;;
-        '"Lunch (12pm)"')
+        'Lunch (12pm)')
             future_hour=12
             future_minute=0
             if [[ "$current_hour" -lt 12 ]]; then
@@ -218,7 +225,7 @@ handle_deferral() {
             fi
             log "User chose to defer until 12 PM."
             ;;
-        '"End of Day (5pm)"')
+        'End of Day (5pm)')
             future_hour=17
             future_minute=0
             if [[ "$current_hour" -lt 17 ]]; then
@@ -228,26 +235,26 @@ handle_deferral() {
             fi
             log "User chose to defer until 5 PM."
             ;;
-        '"1 hour"')
+        '1 hour')
             future_hour=$(date -v+1H +%H)
             future_minute=$(date -v+1H +%M)
             friendly_time=$(date -v+1H +"today at %-I:%M %p")
             log "User chose to defer for 1 hour."
             ;;
-        '"2 hours"')
+        '2 hours')
             future_hour=$(date -v+2H +%H)
             future_minute=$(date -v+2H +%M)
             friendly_time=$(date -v+2H +"today at %-I:%M %p")
             log "User chose to defer for 2 hours."
             ;;
-        '"4 hours"')
+        '4 hours')
             future_hour=$(date -v+4H +%H)
             future_minute=$(date -v+4H +%M)
             friendly_time=$(date -v+4H +"today at %-I:%M %p")
             log "User chose to defer for 4 hours."
             ;;
         *)
-            log "ERROR: Deferral choice '$defer_choice' did not match. Defaulting to 1 hour."
+            log "ERROR: Deferral choice '$defer_choice' (Exit: $exit_code) did not match. Defaulting to 1 hour."
             future_hour=$(date -v+1H +%H)
             future_minute=$(date -v+1H +%M)
             friendly_time=$(date -v+1H +"today at %-I:%M %p")
