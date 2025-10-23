@@ -170,12 +170,11 @@ handle_deferral() {
     local current_hour
     current_hour=$(date +%H)
     
-    # --- FINAL, ROBUST SOLUTION: Dropdown with Key-Value Pairs ---
+    # --- NEW SOLUTION: Use --dropdown ---
+    # This is a much simpler and more robust command than --select.
+    # It takes a simple comma-separated list.
     
-    # THIS IS THE FIX:
-    # Each "value" (the part after =) that contains a space must be
-    # enclosed in single quotes.
-    local select_values="9am='Start of Day (9am)',12pm='Lunch (12pm)',5pm='End of Day (5pm)',1h='1 hour',2h='2 hours',4h='4 hours'"
+    local dropdown_options="'Start of Day (9am)','Lunch (12pm)','End of Day (5pm)','1 hour','2 hours','4 hours'"
     
     defer_choice=$("$DIALOG_BINARY" \
         --title "Choose Deferral Time" \
@@ -184,7 +183,8 @@ handle_deferral() {
         --width 450 \
         --height 250 \
         --messagefont "size=12" \
-        --select "title='Deferral Options',values=$select_values,default=1h" \
+        --dropdown "Deferral Options, $dropdown_options" \
+        --default "1 hour" \
         --button1text "Confirm Deferral" \
         --button2text "Cancel")
     
@@ -201,9 +201,9 @@ handle_deferral() {
         exit 0
     fi
     
-    # Reordered case statement to match the new KEY output
+    # Updated case statement to match the literal string output
     case "$defer_choice" in
-        '9am')
+        'Start of Day (9am)')
             future_hour=9
             future_minute=0
             if [[ "$current_hour" -lt 9 ]]; then
@@ -213,7 +213,7 @@ handle_deferral() {
             fi
             log "User chose to defer until 9 AM."
             ;;
-        '12pm')
+        'Lunch (12pm)')
             future_hour=12
             future_minute=0
             if [[ "$current_hour" -lt 12 ]]; then
@@ -223,7 +223,7 @@ handle_deferral() {
             fi
             log "User chose to defer until 12 PM."
             ;;
-        '5pm')
+        'End of Day (5pm)')
             future_hour=17
             future_minute=0
             if [[ "$current_hour" -lt 17 ]]; then
@@ -233,19 +233,19 @@ handle_deferral() {
             fi
             log "User chose to defer until 5 PM."
             ;;
-        '1h')
+        '1 hour')
             future_hour=$(date -v+1H +%H)
             future_minute=$(date -v+1H +%M)
             friendly_time=$(date -v+1H +"today at %-I:%M %p")
             log "User chose to defer for 1 hour."
             ;;
-        '2h')
+        '2 hours')
             future_hour=$(date -v+2H +%H)
             future_minute=$(date -v+2H +%M)
             friendly_time=$(date -v+2H +"today at %-I:%M %p")
             log "User chose to defer for 2 hours."
             ;;
-        '4h')
+        '4 hours')
             future_hour=$(date -v+4H +%H)
             future_minute=$(date -v+4H +%M)
             friendly_time=$(date -v+4H +"today at %-I:%M %p")
