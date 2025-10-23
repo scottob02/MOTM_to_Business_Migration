@@ -180,10 +180,10 @@ handle_deferral() {
         --width 450
         --height 250
         --messagefont "size=12"
-        # CRITICAL FIX: The --select flag and its value are now
-        # two separate, distinct elements in the array.
+        # CRITICAL FIX: The syntax of the value string itself is now correct.
+        # title="Deferral Options" is now quoted.
         --select 
-        "title=Deferral Options, values='Start of Day (9am)','Lunch (12pm)','End of Day (5pm)','1 hour','2 hours','4 hours', default='1 hour'"
+        'title="Deferral Options",values="Start of Day (9am)","Lunch (12pm)","End of Day (5pm)","1 hour","2 hours","4 hours",default="1 hour"'
         --button1text "Confirm Deferral"
     )
     
@@ -197,9 +197,9 @@ handle_deferral() {
     # DEBUG line to see what swiftDialog is *actually* outputting
     log "DEBUG: User selected deferral choice: '$defer_choice'"
     
-    # Reordered case statement to match the new list and *include the single quotes*
+    # Reordered case statement to match the new list and *include the DOUBLE quotes*
     case "$defer_choice" in
-        "'Start of Day (9am)'")
+        '"Start of Day (9am)"')
             future_hour=9
             future_minute=0
             if [[ "$current_hour" -lt 9 ]]; then
@@ -209,7 +209,7 @@ handle_deferral() {
             fi
             log "User chose to defer until 9 AM."
             ;;
-        "'Lunch (12pm)'")
+        '"Lunch (12pm)"')
             future_hour=12
             future_minute=0
             if [[ "$current_hour" -lt 12 ]]; then
@@ -219,7 +219,7 @@ handle_deferral() {
             fi
             log "User chose to defer until 12 PM."
             ;;
-        "'End of Day (5pm)'")
+        '"End of Day (5pm)"')
             future_hour=17
             future_minute=0
             if [[ "$current_hour" -lt 17 ]]; then
@@ -229,19 +229,19 @@ handle_deferral() {
             fi
             log "User chose to defer until 5 PM."
             ;;
-        "'1 hour'")
+        '"1 hour"')
             future_hour=$(date -v+1H +%H)
             future_minute=$(date -v+1H +%M)
             friendly_time=$(date -v+1H +"today at %-I:%M %p")
             log "User chose to defer for 1 hour."
             ;;
-        "'2 hours'")
+        '"2 hours"')
             future_hour=$(date -v+2H +%H)
             future_minute=$(date -v+2H +%M)
             friendly_time=$(date -v+2H +"today at %-I:%M %p")
             log "User chose to defer for 2 hours."
             ;;
-        "'4 hours'")
+        '"4 hours"')
             future_hour=$(date -v+4H +%H)
             future_minute=$(date -v+4H +%M)
             friendly_time=$(date -v+4H +"today at %-I:%M %p")
