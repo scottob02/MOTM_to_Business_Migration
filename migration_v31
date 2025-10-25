@@ -110,9 +110,6 @@ show_dialog_confirm() {
 # ─── DEFERRAL & SCHEDULING FUNCTIONS ──────────────────────────────────────────
 #
 
-# ---
-# --- schedule_relaunch function UPDATED ---
-# ---
 schedule_relaunch() {
     local hour=$1
     local minute=$2
@@ -135,7 +132,7 @@ schedule_relaunch() {
     <string>com.lbg.jamf-migration</string>
     <key>ProgramArguments</key>
     <array>
-        <!-- THIS IS THE FIX: Added /usr/bin/sudo -->
+        <!-- Added /usr/bin/sudo to ensure it runs as root -->
         <string>/usr/bin/sudo</string>
         <string>/usr/local/bin/jamf</string>
         <string>policy</string>
@@ -174,6 +171,9 @@ remove_relaunch_agent() {
     fi
 }
 
+# ---
+# --- handle_deferral FUNCTION - NOW WITH JSON PARSING FIX ---
+# ---
 handle_deferral() {
     deferral_count=$((deferral_count + 1))
     defaults write "$PLIST_PATH" DeferralCount -int "$deferral_count"
@@ -183,9 +183,11 @@ handle_deferral() {
     local current_hour
     current_hour=$(date +%H)
     
-    # Use key:value pairs for --selectvalues. This is more robust.
-    # swiftDialog will display the "value" (friendly text) but return the "key" (e.g., "1h").
-    defer_choice=$("$DIALOG_BINARY" --title "Choose Deferral Time" \
+    # --- THIS IS THE FIX ---
+    
+    # 1. Capture the JSON output from swiftDialog
+    local defer_choice_json
+    defer_choice_json=$("$DIALOG_BINARY" --title "Choose Deferral Time" \
       --message "When should we remind you? This prompt will reappear at the time you select." \
       --icon "$BRANDING_ICON" --width 450 --height 250 --messagefont "size=12" \
       --selecttitle "Deferral Options" \
@@ -193,11 +195,16 @@ handle_deferral() {
       --selectdefault "1h" \
       --button1text "Confirm Deferral")
     
-    # Exit if user hits Cancel (returns non-zero)
+    # 2. Check for "Cancel" (non-zero exit code) - this must be done *before* parsing
     [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
     
-    # Matches on the simple keys (e.g., "1h") returned from the dialog.
-    # Also fixes the "friendly_time" bug for relative times crossing midnight.
+    # 3. Parse the JSON to get the *actual* key (e.g., "1h")
+    local defer_choice
+    defer_choice=$(echo "$defer_choice_json" | jq -r '.selected_key')
+    
+    # --- END OF FIX ---
+    
+    # This case statement will now receive the correct value ("1h", "2h", "12pm", etc.)
     case "$defer_choice" in
         "1h")
             future_hour=$(date -v+1H +%H)
@@ -261,7 +268,7 @@ handle_deferral() {
             log "User chose to defer until 9 AM."
             ;;
         *)
-            log "Invalid deferral choice: $defer_choice. Defaulting to 1 hour."
+            log "Invalid deferral choice received: '$defer_choice'. Defaulting to 1 hour."
             future_hour=$(date -v+1H +%H)
             future_minute=$(date -v+1H +%M)
             if [[ "$(date -v+1H +%d)" == "$(date +%d)" ]]; then
@@ -579,7 +586,7 @@ trigger_remote_wipe() {
     
     if $dry_run;
     then
-        log "[DRY-RUN] Would have sent ErSaseDevice command for management ID $management_id."
+        log "[DRY-RUN] Would have sent EraseDevice command for management ID $management_id."
         success "[DRY-RUN] Remote wipe would have been initiated."
         return
     fi
@@ -596,7 +603,7 @@ trigger_remote_wipe() {
       "clientData": [{"managementId": "%s"}]
     }' "$management_id")
 
-    # The correct endpoint for this command is /api/v2/mdm/commands
+    # The correct endpoint for this command is /api/vj2/mdm/commands
     response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
        
      "$origin_jamf_url/api/v2/mdm/commands" \
