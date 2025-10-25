@@ -206,7 +206,8 @@ handle_deferral() {
     # 3. (THE FIX) Parse the JSON with jq to get *only* the key (e.g., "1h", "2h")
     #    This is the crucial step that prevents the bug you described.
     local defer_choice
-    defer_choice=$(echo "$defer_choice_json" | "$JQ_BINARY" -r '.selected_key')
+    # --- UPDATED LINE: Use a here-string (<<<) instead of echo|pipe ---
+    defer_choice=$("$JQ_BINARY" -r '.selected_key' <<< "$defer_choice_json")
     
     # 4. Added explicit logging so you can see the result in your log file
     log "Parsed defer_choice from swiftDialog JSON: '$defer_choice'"
