@@ -13,7 +13,7 @@ LAUNCH_AGENT_PATH="/Users/$LOGGED_IN_USER/Library/LaunchAgents/com.lbg.jamf-migr
 # --- SwiftDialog Settings ---
 DIALOG_BINARY="/usr/local/bin/dialog"
 # --- FIX: Define the full path to jq ---
-JQ_BINARY="/usr/local/bin/jq"
+JQ_BINARY="/usr/bin/jq"
 BRANDING_ICON="/Users/Shared/LBG_Branding_Cancara/lbg_primary_logo.png" 
 
 # --- Jamf API Credentials & Endpoints ---
@@ -185,9 +185,11 @@ handle_deferral() {
     local current_hour
     current_hour=$(date +%H)
     
-    # --- THIS IS THE FIX ---
+    # ---
+    # --- THIS IS THE CORRECT IMPLEMENTATION ---
+    # ---
     
-    # 1. Capture the JSON output from swiftDialog
+    # 1. Capture the JSON output from swiftDialog into its own variable
     local defer_choice_json
     defer_choice_json=$("$DIALOG_BINARY" --title "Choose Deferral Time" \
       --message "When should we remind you? This prompt will reappear at the time you select." \
@@ -197,11 +199,11 @@ handle_deferral() {
       --selectdefault "1h" \
       --button1text "Confirm Deferral")
     
-    # 2. Check for "Cancel" (non-zero exit code) - this must be done *before* parsing
+    # 2. Check for "Cancel" (non-zero exit code)
     [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
     
-    # 3. Parse the JSON to get the *actual* key (e.g., "1h")
-    #    USE THE $JQ_BINARY variable to ensure the command is found
+    # 3. (THE FIX) Parse the JSON with jq to get *only* the key (e.g., "1h", "2h")
+    #    This is the crucial step that prevents the bug you described.
     local defer_choice
     defer_choice=$(echo "$defer_choice_json" | "$JQ_BINARY" -r '.selected_key')
     
@@ -210,7 +212,8 @@ handle_deferral() {
     
     # --- END OF FIX ---
     
-    # This case statement will now receive the correct value ("1h", "2h", "12pm", etc.)
+    # This case statement now receives the correct, simple string ("1h", "2h", etc.)
+    # and will match the correct block.
     case "$defer_choice" in
         "1h")
             future_hour=$(date -v+1H +%H)
@@ -274,7 +277,7 @@ handle_deferral() {
             log "User chose to defer until 9 AM."
             ;;
         *)
-            # This block will now only be hit if jq *really* fails for some reason
+            # This block will now only be hit if jq fails or returns an empty string
             log "Invalid deferral choice received: '$defer_choice'. Defaulting to 1 hour."
             future_hour=$(date -v+1H +%H)
             future_minute=$(date -v+1H +%M)
