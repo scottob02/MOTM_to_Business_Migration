@@ -197,7 +197,8 @@ handle_deferral() {
       --selecttitle "Deferral Options" \
       --selectvalues "1h: Remind me in 1 Hour, 2h: Remind me in 2 Hours, 4h: Remind me in 4 Hours, 12pm: Defer until 12:00 PM, 5pm: Defer until 5:00 PM, 9am: Defer until 9:00 AM" \
       --selectdefault "1h" \
-      --button1text "Confirm Deferral")
+      --button1text "Confirm Deferral" \
+      --json) # <-- ADD THIS FLAG
     
     # 2. Check for "Cancel" (non-zero exit code)
     [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
