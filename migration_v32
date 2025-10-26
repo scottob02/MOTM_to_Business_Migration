@@ -632,8 +632,8 @@ trigger_remote_wipe() {
     }' "$management_id")
 
     # The correct endpoint for this command is /api/v2/mdm/commands
+    # --- FIX: Removed an extra blank line from the curl command ---
     response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
-       
      "$origin_jamf_url/api/v2/mdm/commands" \
         -H "Authorization: Bearer $bearer_token" \
         -H "Content-Type: application/json" \
