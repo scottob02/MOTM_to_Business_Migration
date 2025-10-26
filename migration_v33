@@ -118,6 +118,9 @@ schedule_relaunch() {
     
     log "Scheduling relaunch for Hour: $hour, Minute: $minute"
     
+    # --- FIX: Create the LaunchAgents directory if it doesn't exist ---
+    mkdir -p "$(dirname "$LAUNCH_AGENT_PATH")"
+    
     # Unload any existing agent to ensure we are setting a new schedule
     if [ -f "$LAUNCH_AGENT_PATH" ];
     then
