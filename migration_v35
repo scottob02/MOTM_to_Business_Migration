@@ -543,7 +543,7 @@ check_jamf_enrollment() {
     
     if [[ "$current_jss_url" == "$target_jamf_url"* ]];
     then
-      err "check_jamf_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
+      err "check_jss_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
     elif [[ "$current_jss_url" != "$origin_jamf_url"* ]]; then
       log "WARN: Device is enrolled in neither the origin nor target Jamf instance. Current: $current_jss_url"
     else
@@ -713,7 +713,7 @@ trigger_remote_wipe() {
 #
 
 main() {
-  # setup_environment now checks for logged in user
+  # --- FIX: Corrected typo from setup_enviroment to setup_environment ---
   setup_environment
   check_hardware_support
   check_deferral
