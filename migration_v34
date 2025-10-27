@@ -121,10 +121,16 @@ schedule_relaunch() {
     # --- FIX: Create the LaunchAgents directory if it doesn't exist ---
     mkdir -p "$(dirname "$LAUNCH_AGENT_PATH")"
     
-    # Unload any existing agent to ensure we are setting a new schedule
+    # --- FIX: Aggressively unload/remove any existing agent ---
+    local agent_service_name="gui/$(id -u "$LOGGED_IN_USER")/com.lbg.jamf-migration"
+    if launchctl print "$agent_service_name" &>/dev/null; then
+        log "Found existing agent. Booting out..."
+        launchctl bootout "$agent_service_name" &>/dev/null
+    fi
     if [ -f "$LAUNCH_AGENT_PATH" ];
     then
-        launchctl bootout "gui/$(id -u "$LOGGED_IN_USER")" "$LAUNCH_AGENT_PATH" &>/dev/null
+        log "Removing existing agent file."
+        rm "$LAUNCH_AGENT_PATH"
     fi
 
     # Create the launch agent plist
@@ -184,8 +190,12 @@ EOF
     chown "$LOGGED_IN_USER" "$LAUNCH_AGENT_PATH"
     chmod 644 "$LAUNCH_AGENT_PATH"
 
-    # Load the new agent
-    launchctl bootstrap "gui/$(id -u "$LOGGED_IN_USER")" "$LAUNCH_AGENT_PATH"
+    # --- FIX: Load the new agent with error checking ---
+    if ! launchctl bootstrap "gui/$(id -u "$LOGGED_IN_USER")" "$LAUNCH_AGENT_PATH"; then
+      err "schedule_relaunch" "Failed to bootstrap (load) the Launch Agent!"
+    else
+      success "Launch Agent successfully loaded (bootstrapped)."
+    fi
     log "Launch Agent loaded and scheduled to run policy $JAMF_POLICY_ID."
 }
 
@@ -597,7 +607,7 @@ get_computer_inventory_id() {
     http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
     response_body=$(echo "$response" | sed '$d')
 
-    if [[ "$http_status" -ne 200 ]];
+    if [[ "$http_stopat" -ne 200 ]];
     then
         err "get_computer_inventory_id" "Jamf API request failed with HTTP status $http_status."
     fi
