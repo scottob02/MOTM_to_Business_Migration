@@ -7,12 +7,9 @@
 # --- Deferral Settings ---
 MAX_DEFERRALS=5
 LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
-LOGGED_IN_UID=$(id -u "$LOGGED_IN_USER")
 PLIST_PATH="/Users/$LOGGED_IN_USER/Library/Application Support/LBG/com.lbg.jamf-migration.plist"
-
-# --- FIX: Changed to System-Level LaunchDaemon ---
-LAUNCH_AGENT_PATH="/Library/LaunchDaemons/com.lbg.jamf-migration.plist"
-LAUNCH_AGENT_LABEL="com.lbg.jamf-migration"
+# --- FIX: Changed to a Launch Daemon path for root privileges ---
+LAUNCH_DAEMON_PATH="/Library/LaunchDaemons/com.lbg.jamf-migration.plist"
 
 # --- SwiftDialog Settings ---
 DIALOG_BINARY="/usr/local/bin/dialog"
@@ -58,9 +55,7 @@ err() {
   printf '%b[%s] [ERROR] [%s] %s%b\n' \
     "$RED" "$(date '+%Y-%m-%dT%H:%M:%S')" "$caller" "$message" "$NC" |
   tee -a "$LOG_FILE" >&2
-  # --- FIX: Use new helper function for dialogs ---
-  run_dialog_as_user --title "Migration Error" --message "[$caller] $message" --icon "SF=xmark.octagon.fill,colour=red" \
-    --button1text "Close" --width 450 --height 250 --messagefont "size=12"
+  show_dialog_error "[$caller] $message"
   exit 1
 }
 
@@ -96,37 +91,19 @@ urlencode() {
 # ─── SWIFTDIALOG FUNCTIONS ────────────────────────────────────────────────────
 #
 
-# --- FIX: New helper function to run dialogs as the logged-in user from a root script ---
-run_dialog_as_user() {
-  local dialog_cmd=("$@")
-  
-  if [ -n "$LOGGED_IN_USER" ] && [ "$LOGGED_IN_USER" != "root" ] && [ -n "$LOGGED_IN_UID" ]; then
-    # Use launchctl asuser to run the command in the user's GUI context
-    # Use sudo -u to drop privileges to the user
-    # The output (stdout) of swiftDialog will be captured and returned
-    launchctl asuser "$LOGGED_IN_UID" sudo -u "$LOGGED_IN_USER" "$DIALOG_BINARY" "${dialog_cmd[@]}"
-    return $?
-  else
-    log "Dialog error: Could not find logged in user to display dialog."
-    return 1
-  fi
-}
-
 show_dialog_error() {
-  # This function is now just a wrapper for the new helper
-  run_dialog_as_user --title "Migration Error" --message "$1" --icon "SF=xmark.octagon.fill,colour=red" \
+  "$DIALOG_BINARY" --title "Migration Error" --message "$1" --icon "SF=xmark.octagon.fill,colour=red" \
     --button1text "Close" --width 450 --height 250 --messagefont "size=12"
 }
 
 show_dialog_info() {
-    # --- FIX: Use new helper function for dialogs ---
-    run_dialog_as_user --title "$1" --message "$2" --icon "$BRANDING_ICON" \
+    "$DIALOG_BINARY" --title "$1" --message "$2" --icon "$BRANDING_ICON" \
       --button1text "OK" --width 450 --height 250 --messagefont "size=12"
 }
 
 show_dialog_confirm() {
-   # --- FIX: Use new helper function for dialogs ---
-   run_dialog_as_user --title "$1" --message "$2" --icon "$BRANDING_ICON" \
+   
+   "$DIALOG_BINARY" --title "$1" --message "$2" --icon "$BRANDING_ICON" \
       --button1text "${3:-Proceed}" --button2text "${4:-Cancel}" --width 550 --height 350 --messagefont "size=12"
     return $?
 }
@@ -136,44 +113,49 @@ show_dialog_confirm() {
 # ─── DEFERRAL & SCHEDULING FUNCTIONS ──────────────────────────────────────────
 #
 
+# ---
+# --- FIX: THIS ENTIRE FUNCTION HAS BEEN REPLACED ---
+# ---
 schedule_relaunch() {
     local hour=$1
     local minute=$2
     
     log "Scheduling relaunch for Hour: $hour, Minute: $minute"
     
-    # --- FIX: Aggressively unload/remove any existing agent ---
-    # Note: System agents are in the 'system' domain
-    local agent_service_name="system/$LAUNCH_AGENT_LABEL"
-    if launchctl print "$agent_service_name" &>/dev/null; then
-        log "Found existing agent. Booting out..."
-        launchctl bootout "$agent_service_name" &>/dev/null
+    # --- FIX: Use the Launch Daemon path ---
+    mkdir -p "$(dirname "$LAUNCH_DAEMON_PATH")"
+    
+    # --- FIX: Use the system/.. service name for a Launch Daemon ---
+    local daemon_service_name="system/com.lbg.jamf-migration"
+    
+    if launchctl print "$daemon_service_name" &>/dev/null; then
+        log "Found existing daemon. Booting out..."
+        # --- FIX: Bootout from 'system' context ---
+        launchctl bootout "$daemon_service_name" &>/dev/null
     fi
-    if [ -f "$LAUNCH_AGENT_PATH" ];
-    then
-        log "Removing existing agent file."
-        rm "$LAUNCH_AGENT_PATH"
+    
+    # --- FIX: Use the Launch Daemon path ---
+    if [ -f "$LAUNCH_DAEMON_PATH" ]; then
+        log "Removing existing daemon file."
+        rm "$LAUNCH_DAEMON_PATH"
     fi
 
-    # Create the launch agent plist
-    cat << EOF > "$LAUNCH_AGENT_PATH"
+    # --- FIX: Create the Launch Daemon plist ---
+    cat << EOF > "$LAUNCH_DAEMON_PATH"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>$LAUNCH_AGENT_LABEL</string>
+    <string>com.lbg.jamf-migration</string>
     <key>ProgramArguments</key>
     <array>
+        <!-- This will now run as root, so no sudo is needed. -->
         <string>/usr/local/bin/jamf</string>
         <string>policy</string>
         <string>-id</string>
         <string>$JAMF_POLICY_ID</string>
     </array>
-    
-    <!-- FIX: Run as root -->
-    <key>UserName</key>
-    <string>root</string>
     
     <key>StartCalendarInterval</key>
     <dict>
@@ -191,7 +173,9 @@ schedule_relaunch() {
     <key>ThrottleInterval</key>
     <integer>600</integer>
     
-    <!-- FIX: Log to system log path -->
+    <!-- 
+      FIX: Changed log paths to /var/log/ for a system daemon
+    -->
     <key>StandardOutPath</key>
     <string>/var/log/com.lbg.jamf-migration.out.log</string>
     <key>StandardErrorPath</key>
@@ -203,27 +187,29 @@ schedule_relaunch() {
 </plist>
 EOF
 
-    # Set correct ownership and permissions for /Library/LaunchDaemons
-    chown root:wheel "$LAUNCH_AGENT_PATH"
-    chmod 644 "$LAUNCH_AGENT_PATH"
+    # --- FIX: Set correct ownership (root:wheel) for a Launch Daemon ---
+    chown root:wheel "$LAUNCH_DAEMON_PATH"
+    chmod 644 "$LAUNCH_DAEMON_PATH"
 
-    # --- FIX: Load the new agent with error checking into the 'system' domain ---
-    # This command must be run as root, which is fine (script runs as root)
-    if ! launchctl bootstrap system "$LAUNCH_AGENT_PATH"; then
-      err "schedule_relaunch" "Failed to bootstrap (load) the Launch Agent!"
+    # --- FIX: Load the new daemon into the 'system' context ---
+    if ! launchctl bootstrap "system" "$LAUNCH_DAEMON_PATH"; then
+      err "schedule_relaunch" "Failed to bootstrap (load) the Launch Daemon!"
     else
-      success "Launch Agent successfully loaded (bootstrapped)."
+      success "Launch Daemon successfully loaded (bootstrapped)."
     fi
-    log "Launch Agent loaded and scheduled to run policy $JAMF_POLICY_ID."
+    log "Launch Daemon loaded and scheduled to run policy $JAMF_POLICY_ID."
 }
 
+# ---
+# --- FIX: THIS ENTIRE FUNCTION HAS BEEN REPLACED ---
+# ---
 remove_relaunch_agent() {
-    if [ -f "$LAUNCH_AGENT_PATH" ];
-    then
-        log "Removing relaunch agent."
-        # --- FIX: Bootout from 'system' domain ---
-        launchctl bootout system "$LAUNCH_AGENT_PATH" &>/dev/null
-        rm "$LAUNCH_AGENT_PATH"
+    # --- FIX: Use the Launch Daemon path ---
+    if [ -f "$LAUNCH_DAEMON_PATH" ]; then
+        log "Removing relaunch daemon."
+        # --- FIX: Bootout from 'system' context and use the daemon path ---
+        launchctl bootout "system/$LAUNCH_DAEMON_PATH" &>/dev/null
+        rm "$LAUNCH_DAEMON_PATH"
     fi
 }
 
@@ -241,36 +227,40 @@ handle_deferral() {
     
     # --- THIS IS THE FIX ---
     
-    # 1. Capture the JSON output from swiftDialog using our new helper
+    # 1. Capture the JSON output from swiftDialog
     local defer_choice_json
-    # --- FIX: Use new helper function for dialogs ---
-    defer_choice_json=$(run_dialog_as_user --title "Choose Deferral Time" \
+    defer_choice_json=$("$DIALOG_BINARY" --title "Choose Deferral Time" \
       --message "When should we remind you? This prompt will reappear at the time you select." \
       --icon "$BRANDING_ICON" --width 450 --height 250 --messagefont "size=12" \
       --selecttitle "Deferral Options" \
       --selectvalues "1h: Remind me in 1 Hour, 2h: Remind me in 2 Hours, 4h: Remind me in 4 Hours, 12pm: Defer until 12:00 PM, 5pm: Defer until 5:00 PM, 9am: Defer until 9:00 AM" \
       --selectdefault "1h" \
       --button1text "Confirm Deferral" \
-      --json)
+      --json) # <-- FIX: Added --json flag
     
-    # 2. Check for "Cancel" (non-zero exit code)
+    # 2. Check for "Cancel" (non-zero exit code) - this must be done *before* parsing
     [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
     
     # 3. Log the raw JSON output for debugging
     log "Raw JSON from dialog: $defer_choice_json"
     
-    # 4. Parse the JSON
+    # 4. Parse the JSON to get the *actual* key (e.g., "1h")
+    #    USE THE $JQ_BINARY variable to ensure the command is found
+    #    FIX: Use correct jq query for nested JSON and split "4h:..." string
     local defer_choice
     defer_choice=$("$JQ_BINARY" -r '.["Deferral Options"].selectedValue | split(":")[0]' <<< "$defer_choice_json")
     
+    # 4. Added explicit logging so you can see the result in your log file
     log "Parsed defer_choice from swiftDialog JSON: '$defer_choice'"
     
     # --- END OF FIX ---
     
+    # This case statement will now receive the correct value ("1h", "2h", "12pm", etc.)
     case "$defer_choice" in
         "1h")
             future_hour=$(date -v+1H +%H)
             future_minute=$(date -v+1H +%M)
+            # Check if we crossed midnight
             if [[ "$(date -v+1H +%d)" == "$(date +%d)" ]]; then
                 friendly_time=$(date -v+1H +"today at %-I:%M %p")
             else
@@ -329,6 +319,7 @@ handle_deferral() {
             log "User chose to defer until 9 AM."
             ;;
         *)
+            # This block will now only be hit if jq *really* fails for some reason
             log "Invalid deferral choice received: '$defer_choice'. Defaulting to 1 hour."
             future_hour=$(date -v+1H +%H)
             future_minute=$(date -v+1H +%M)
@@ -341,10 +332,9 @@ handle_deferral() {
     esac
 
     schedule_relaunch "$future_hour" "$future_minute"
-    # --- FIX: Use new helper function for dialogs ---
     show_dialog_info "Migration Deferred" "You will be reminded $friendly_time."
     
-    # This plist is still per-user, so chown is correct
+    # We must also chown the plist, as this function may create it
     chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
     
     exit 0
@@ -355,10 +345,11 @@ check_deferral() {
     log "Plist not found. Creating with 0 deferrals."
     local plist_dir
     plist_dir=$(dirname "$PLIST_PATH")
-    # This command runs as root, but needs to create a user-owned dir
-    sudo -u "$LOGGED_IN_USER" mkdir -p "$plist_dir"
+    mkdir -p "$plist_dir"
+    # Set ownership of the new directory to the user
     chown -R "$LOGGED_IN_USER" "$plist_dir"
     defaults write "$PLIST_PATH" DeferralCount -int 0
+    # Set ownership of the new plist to the user
     chown "$LOGGED_IN_USER" "$PLIST_PATH"
   fi
   
@@ -367,11 +358,9 @@ check_deferral() {
 
   log "Deferral count: $deferral_count. Remaining: $remaining_deferrals."
   if [ "$remaining_deferrals" -le 0 ]; then
-    # --- FIX: Use new helper function for dialogs ---
     show_dialog_info "Mandatory Migration" "The migration is now mandatory and the process will begin automatically."
     remove_relaunch_agent # Clean up scheduler as it's no longer needed
   else
-    # --- FIX: Use new helper function for dialogs ---
     if show_dialog_confirm "StratMac to LBG Business Migration" "This Mac is now due to migrate over to the new LBG Business build for Apple Mac devices.\n\n The entire process will take roughly 1 hour depending on your internet speed.\n\n You have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
         log "User chose to migrate."
         remove_relaunch_agent # Clean up scheduler
@@ -389,7 +378,6 @@ show_requirements_dialog() {
     message+="* **Data Backed-up:** Any information, files, or notes you wish 
 to keep must be saved and uploaded to OneDrive. Anything not stored in OneDrive will be permanetly deleted. \n\n"
     message+="Additionally this process will close all open applications and then perform a factory reset which will wipe all data from this Mac."
-    # --- FIX: Use new helper function for dialogs ---
     if ! show_dialog_confirm "Migration Requirements" "$message" "I Understand, Continue" "Cancel";
     then
         log "User cancelled at the requirements screen."
@@ -407,8 +395,7 @@ This is your final confirmation that **all data on this Mac will be permanently 
 - Only files you have saved and **fully synced to OneDrive** will be available after the migration.
 
 Please double-check that OneDrive has finished syncing all your important files."
-    # --- FIX: Use new helper function for dialogs ---
-    if ! run_dialog_as_user --title "Have You Synced All Your Data?" \
+    if ! "$DIALOG_BINARY" --title "Have You Synced All Your Data?" \
         --message "$message" \
         --icon "SF=exclamationmark.triangle.fill,colour=red" \
         --button1text "I confirm I have synced everything I need" \
@@ -441,19 +428,12 @@ setup_environment() {
     fi
     if [ -z "$JAMF_POLICY_ID" ]; then error_msg+="\n- JAMF_POLICY_ID (e.g., 123)"; missing_params=true;
     fi
-    
-    # --- FIX: Check for logged in user early, as dialogs depend on it ---
-    if [ -z "$LOGGED_IN_USER" ] || [ "$LOGGED_IN_USER" == "root" ] || [ -z "$LOGGED_IN_UID" ]; then
-      # Can't use 'err' function here as it shows a dialog
-      log "[ERROR] [setup_environment] Could not find a logged-in user. This script must be run when a user is logged in."
-      exit 1
-    fi
-    log "Running as root, but for user $LOGGED_IN_USER (UID: $LOGGED_IN_UID)"
 
     if $missing_params; then
       err "setup_environment" "$error_msg"
     fi
     
+    # --- FIX: Check for required binaries ---
     if [[ ! -x "$DIALOG_BINARY" ]]; then
       err "setup_environment" "swiftDialog not found at $DIALOG_BINARY. Please install it."
     fi
@@ -469,11 +449,9 @@ setup_environment() {
     dry_run=$(echo "$DRY_RUN" | tr '[:upper:]' '[:lower:]')
     [[ "$dry_run" == "true" ]] && dry_run=true || dry_run=false
 
-    # This log is user-specific, so chown it
     log_dir=$(dirname "$LOG_FILE")
-    sudo -u "$LOGGED_IN_USER" mkdir -p "$log_dir" 2>/dev/null
+    mkdir -p "$log_dir" 2>/dev/null
     touch "$LOG_FILE" 2>/dev/null
-    chown "$LOGGED_IN_USER" "$LOG_FILE"
     
     serial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
     [ -z "$serial" ] && err "setup_environment" "Could not determine serial number."
@@ -504,6 +482,7 @@ check_os_version() {
 get_connection_type() {
   log "Determining active network service…"
   
+  # Extract the hostname from the origin Jamf URL
   local jamf_host
   jamf_host=$(echo "$origin_jamf_url" | awk -F/ '{print $3}')
 
@@ -543,7 +522,7 @@ check_jamf_enrollment() {
     
     if [[ "$current_jss_url" == "$target_jamf_url"* ]];
     then
-      err "check_jss_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
+      err "check_jamf_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
     elif [[ "$current_jss_url" != "$origin_jamf_url"* ]]; then
       log "WARN: Device is enrolled in neither the origin nor target Jamf instance. Current: $current_jss_url"
     else
@@ -557,8 +536,7 @@ kill_user_apps() {
   log "Starting graceful application termination..."
   
   local app_pids=()
-  # Run ps as the user to find their apps
-  ps -ax -o pid,command -U "$LOGGED_IN_USER" | grep "/Applications/.*\.app/" | grep -v grep | while read -r pid command;
+  ps -ax -o pid,command | grep "/Applications/.*\.app/" | grep -v grep | while read -r pid command;
   do
     local app_name
     app_name=$(echo "$command" | sed -E 's|.*/Applications/([^/]+)\.app/.*|\1|')
@@ -574,8 +552,7 @@ kill_user_apps() {
     
     if ! $excluded; then
       log "Gracefully terminating $app_name (PID: $pid)"
-      # Run osascript as the user
-      run_cmd launchctl asuser "$LOGGED_IN_UID" sudo -u "$LOGGED_IN_USER" osascript -e "tell application \"$app_name\" to quit" &>/dev/null &
+      run_cmd osascript -e "tell application \"$app_name\" to quit" &>/dev/null &
       app_pids+=("$pid")
     fi
   done
@@ -585,7 +562,6 @@ kill_user_apps() {
   do
     if kill -0 "$pid" &>/dev/null; then
       log "Force killing PID: $pid"
-      # kill -9 can be run as root
       run_cmd kill -9 "$pid"
     fi
   done
@@ -615,6 +591,7 @@ get_jamf_auth_token() {
       -d "grant_type=client_credentials&client_id=$client_id&client_secret=$client_secret"
   )
   bearer_token=$(echo "$response" | jq -r '.access_token')
+  # Use the JQ_BINARY variable here too, just in case
   bearer_token=$(echo "$response" | "$JQ_BINARY" -r '.access_token')
   
   [[ -z "$bearer_token" || "$bearer_token" == "null" ]] && err "get_jamf_auth_token" "Failed to get API token from Jamf Pro."
@@ -627,6 +604,7 @@ get_computer_inventory_id() {
     local filter_encoded
     filter_encoded=$(urlencode "$filter")
 
+    # --- FIX: Changed %%{http_code} to %{http_code} ---
     response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
         -H "Authorization: Bearer $bearer_token" \
         "$origin_jamf_url/api/v1/computers-inventory?section=GENERAL&filter=${filter_encoded}")
@@ -639,6 +617,7 @@ get_computer_inventory_id() {
         err "get_computer_inventory_id" "Jamf API request failed with HTTP status $http_status."
     fi
 
+    # Use JQ_BINARY here for robustness
     computer_id=$(echo "$response_body" | "$JQ_BINARY" -r '.results[0].id')
     management_id=$(echo "$response_body" | "$JQ_BINARY" -r '.results[0].general.managementId')
     
@@ -663,6 +642,7 @@ clear_failed_commands() {
   then
     success "Successfully cleared failed/pending commands (HTTP $http_status)."
   else
+    # This is not a critical failure, so just log a warning.
     log "WARN: Could not clear failed commands (HTTP $http_status). This is non-critical, proceeding anyway."
   fi
 }
@@ -677,9 +657,8 @@ trigger_remote_wipe() {
         return
     fi
     
-    # --- FIX: Use new helper function for dialogs ---
     show_dialog_info "Wipe Command Sent" "The remote wipe command has been sent to this Mac. It will restart and erase itself shortly."
-    
+    # This payload is structured for the /v2/mdm/commands endpoint
     local payload
     payload=$(printf '{
       "commandData": {
@@ -690,6 +669,8 @@ trigger_remote_wipe() {
       "clientData": [{"managementId": "%s"}]
     }' "$management_id")
 
+    # The correct endpoint for this command is /api/v2/mdm/commands
+    # --- FIX: Removed extra blank line after -X POST \ ---
     response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
      "$origin_jamf_url/api/v2/mdm/commands" \
         -H "Authorization: Bearer $bearer_token" \
@@ -713,14 +694,17 @@ trigger_remote_wipe() {
 #
 
 main() {
-  # --- FIX: Corrected typo from setup_enviroment to setup_environment ---
+  # --- Initial Setup & Critical Checks ---
+  # setup_environment now checks for jq and dialog
   setup_environment
   check_hardware_support
   check_deferral
 
+  # --- User Dialogs ---
   show_requirements_dialog
   show_data_backup_dialog
 
+  # --- Run all preflight checks ---
   log "Starting pre-flight checks..."
   check_os_version
   check_device_power_type
@@ -730,12 +714,13 @@ main() {
   check_mdm_profile
   
   log "All pre-flight checks passed."
+  # --- Get Jamf Info ---
   get_jamf_auth_token
   get_computer_inventory_id
   clear_failed_commands
 
-  # --- FIX: Use new helper function for dialogs ---
-  if ! run_dialog_as_user --title "⚠️ POINT OF NO RETURN" \
+  # --- Final Warning & App Kill ---
+  if ! "$DIALOG_BINARY" --title "⚠️ POINT OF NO RETURN" \
     --message "This is your final confirmation.
 
 Clicking the button below will immediately:
@@ -754,10 +739,10 @@ This action cannot be undone." \
   
   kill_user_apps
 
+  # --- Execute Wipe ---
   if $dry_run;
   then
     success "[DRY-RUN] Migration would have proceeded. Device wipe command not sent."
-    # --- FIX: Use new helper function for dialogs ---
     show_dialog_info "Dry-Run Complete" "All checks passed successfully. In a real run, the wipe command would have been sent."
   else
     trigger_remote_wipe
