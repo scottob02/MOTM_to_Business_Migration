@@ -150,11 +150,16 @@ schedule_relaunch() {
     <string>com.lbg.jamf-migration</string>
     <key>ProgramArguments</key>
     <array>
-        <!-- This will now run as root, so no sudo is needed. -->
-        <string>/usr/local/bin/jamf</string>
-        <string>policy</string>
-        <string>-id</string>
-        <string>$JAMF_POLICY_ID</string>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <!-- 
+          FIX: This command will retry until it succeeds, then self-destructs.
+          1. Runs the 'jamf policy' command.
+          2. IF it succeeds (exit 0), it removes this LaunchDaemon plist.
+          3. IF it fails (non-zero), it does NOT remove the plist.
+          4. Our 'KeepAlive' key will then re-run this command in 10 mins.
+        -->
+        <string>/usr/local/bin/jamf policy -id $JAMF_POLICY_ID && /bin/rm $LAUNCH_DAEMON_PATH</string>
     </array>
     
     <!-- 
