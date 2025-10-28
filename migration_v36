@@ -159,7 +159,22 @@ schedule_relaunch() {
           3. IF it fails (non-zero), it does NOT remove the plist.
           4. Our 'KeepAlive' key will then re-run this command in 10 mins.
         -->
-        <string>/usr/local/bin/jamf policy -id $JAMF_POLICY_ID && /bin/rm $LAUNCH_DAEMON_PATH</string>
+        <!-- 
+          FIX (v2): This new command is more robust.
+          It runs the jamf policy command and pipes ALL output (2>&1) to grep.
+          Grep QUIETLY (-q) searches for the "No policies were found" string.
+          
+          IF "No policies..." is NOT found (! grep):
+            The 'if' condition is TRUE.
+            The 'then' block runs, removing the daemon.
+            The command exits 0 (success).
+          
+          IF "No policies..." IS found:
+            The 'if' condition is FALSE.
+            The 'else' block runs, forcing an 'exit 1' (failure).
+            The daemon is NOT removed, and KeepAlive will retry in 10 mins.
+        -->
+        <string>if ! /usr/local/bin/jamf policy -id $JAMF_POLICY_ID 2>&1 | grep -q "No policies were found"; then /bin/rm $LAUNCH_DAEMON_PATH; else exit 1; fi</string>
     </array>
     
     <!-- 
