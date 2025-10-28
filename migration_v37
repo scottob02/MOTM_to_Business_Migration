@@ -35,7 +35,7 @@ computer_id=""
 
 LOG_FILE="/Users/$LOGGED_IN_USER/jamf_migration_preflight.log"
 RED='\033[0;31m';
-GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
+GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0;33m'
 
 log() {
   printf '%b[%s] [INFO]  %s%b\n' \
@@ -114,43 +114,68 @@ show_dialog_confirm() {
 #
 
 # ---
-# --- FIX: THIS ENTIRE FUNCTION HAS BEEN REPLACED to use unique labels ---
+# --- FIX: THIS ENTIRE FUNCTION HAS BEEN REPLACED ---
 # ---
 schedule_relaunch() {
+    # --- FIX: This function now accepts seconds_to_wait ---
     local seconds_to_wait=$1
     
-    # 1. Check for and remove any old, active deferral daemon
-    local old_label
-    old_label=$(defaults read "$PLIST_PATH" ActiveDeferralLabel 2>/dev/null)
+    log "Scheduling relaunch for $seconds_to_wait seconds from now."
     
-    if [[ -n "$old_label" ]]; then
-        log "Found old deferral daemon: $old_label. Removing it."
-        local old_daemon_path="/Library/LaunchDaemons/${old_label}.plist"
-        launchctl bootout "system/$old_label" &>/dev/null
-        rm "$old_daemon_path" &>/dev/null
+    # --- FIX: Use the Launch Daemon path ---
+    mkdir -p "$(dirname "$LAUNCH_DAEMON_PATH")"
+    
+    # --- FIX: Use the system/.. service name for a Launch Daemon ---
+    local daemon_service_name="system/com.lbg.jamf-migration"
+    
+    if launchctl print "$daemon_service_name" &>/dev/null; then
+        log "Found existing daemon. Booting out..."
+        # --- FIX: Bootout from 'system' context ---
+        launchctl bootout "$daemon_service_name" &>/dev/null
     fi
     
-    # 2. Generate a new unique label and path for this deferral
-    local new_label="com.lbg.jamf-migration.$(date +%s)"
-    local new_daemon_path="/Library/LaunchDaemons/${new_label}.plist"
-    log "Scheduling new daemon: $new_label at path $new_daemon_path"
+    # --- FIX: Use the Launch Daemon path ---
+    if [ -f "$LAUNCH_DAEMON_PATH" ]; then
+        log "Removing existing daemon file."
+        rm "$LAUNCH_DAEMON_PATH"
+    fi
 
-    # 3. Create the new Launch Daemon plist
-    cat << EOF > "$new_daemon_path"
+    # --- FIX: Create the Launch Daemon plist ---
+    cat << EOF > "$LAUNCH_DAEMON_PATH"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>$new_label</string>
+    <string>com.lbg.jamf-migration</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
         <string>-c</string>
-        <!-- This robust command will retry until success, then self-destruct -->
-        <string>if ! /usr/local/bin/jamf policy -id $JAMF_POLICY_ID 2>&1 | grep -q "No policies were found"; then /bin/rm $new_daemon_path; else exit 1; fi</string>
+        <!-- 
+          FIX: This command is now simplified to *only* run the policy.
+          The script's own internal logic (remove_relaunch_agent)
+          already handles removing this daemon when the user
+          finally clicks "Migrate Now" or runs out of deferrals.
+          
+          The 'KeepAlive = { SuccessfulExit = false }' key
+          handles the deferral case:
+          1. User defers.
+          2. schedule_relaunch creates a *new* daemon for a future time.
+          3. This script exits 0 (success).
+          4. This *current* daemon job sees the "SuccessfulExit" and stops,
+             allowing the *new* one to take over.
+        -->
+        <string>/usr/local/bin/jamf policy -id $JAMF_POLICY_ID</string>
     </array>
     
+    <!-- 
+      FIX: Replaced StartCalendarInterval with StartInterval.
+      This key runs the job N seconds from when it's loaded,
+      and *will* run on wake if the interval was missed while asleep.
+      Since the script re-runs and re-loads this daemon on every
+      deferral, it effectively acts as a "run once in N seconds" timer.
+    -->
     <key>StartInterval</key>
     <integer>$seconds_to_wait</integer>
     
@@ -162,10 +187,13 @@ schedule_relaunch() {
     <key>ThrottleInterval</key>
     <integer>600</integer>
     
+    <!-- 
+      FIX: Changed log paths to /var/log/ for a system daemon
+    -->
     <key>StandardOutPath</key>
-    <string>/var/log/${new_label}.out.log</string>
+    <string>/var/log/com.lbg.jamf-migration.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/${new_label}.err.log</string>
+    <string>/var/log/com.lbg.jamf-migration.err.log</string>
     
     <key>RunAtLoad</key>
     <false/>
@@ -173,42 +201,29 @@ schedule_relaunch() {
 </plist>
 EOF
 
-    # 4. Set ownership and bootstrap load the new daemon
-    chown root:wheel "$new_daemon_path"
-    chmod 644 "$new_daemon_path"
+    # --- FIX: Set correct ownership (root:wheel) for a Launch Daemon ---
+    chown root:wheel "$LAUNCH_DAEMON_PATH"
+    chmod 644 "$LAUNCH_DAEMON_PATH"
 
-    if ! launchctl bootstrap "system" "$new_daemon_path"; then
-      err "schedule_relaunch" "Failed to bootstrap (load) new Launch Daemon!"
+    # --- FIX: Load the new daemon into the 'system' context ---
+    if ! launchctl bootstrap "system" "$LAUNCH_DAEMON_PATH"; then
+      err "schedule_relaunch" "Failed to bootstrap (load) the Launch Daemon!"
     else
-      success "New Launch Daemon successfully loaded (bootstrapped)."
+      success "Launch Daemon successfully loaded (bootstrapped)."
     fi
-    
-    # 5. Store the *new* label in the user's plist so we can find it next time
-    defaults write "$PLIST_PATH" ActiveDeferralLabel -string "$new_label"
-    
     log "Launch Daemon loaded and scheduled to run policy $JAMF_POLICY_ID."
 }
 
 # ---
-# --- FIX: THIS ENTIRE FUNCTION HAS BEEN REPLACED to use unique labels ---
+# --- FIX: THIS ENTIRE FUNCTION HAS BEEN REPLACED ---
 # ---
 remove_relaunch_agent() {
-    # 1. Read the active label from the user's plist
-    local active_label
-    active_label=$(defaults read "$PLIST_PATH" ActiveDeferralLabel 2>/dev/null)
-    
-    if [[ -n "$active_label" ]]; then
-        log "User chose to migrate. Removing active deferral daemon: $active_label"
-        local active_daemon_path="/Library/LaunchDaemons/${active_label}.plist"
-        
-        # 2. Unload the daemon and delete its file
-        launchctl bootout "system/$active_label" &>/dev/null
-        rm "$active_daemon_path" &>/dev/null
-        
-        # 3. Clear the label from the plist
-        defaults delete "$PLIST_PATH" ActiveDeferralLabel &>/dev/null
-    else
-        log "User chose to migrate. No active deferral daemon found to remove."
+    # --- FIX: Use the Launch Daemon path ---
+    if [ -f "$LAUNCH_DAEMON_PATH" ]; then
+        log "Removing relaunch daemon."
+        # --- FIX: Bootout from 'system' context and use the daemon path ---
+        launchctl bootout "system/$LAUNCH_DAEMON_PATH" &>/dev/null
+        rm "$LAUNCH_DAEMON_PATH"
     fi
 }
 
@@ -634,7 +649,7 @@ get_computer_inventory_id() {
     http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
     response_body=$(echo "$response" | sed '$d')
 
-    if [[ "$http_status" -ne 200 ]];
+    if [[ "$http_s" -ne 200 ]];
     then
         err "get_computer_inventory_id" "Jamf API request failed with HTTP status $http_status."
     fi
