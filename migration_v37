@@ -125,14 +125,17 @@ schedule_relaunch() {
     # --- FIX: Use the Launch Daemon path ---
     mkdir -p "$(dirname "$LAUNCH_DAEMON_PATH")"
     
-    # --- FIX: Use the system/.. service name for a Launch Daemon ---
-    local daemon_service_name="system/com.lbg.jamf-migration"
-    
-    if launchctl print "$daemon_service_name" &>/dev/null; then
-        log "Found existing daemon. Booting out..."
-        # --- FIX: Bootout from 'system' context ---
-        launchctl bootout "$daemon_service_name" &>/dev/null
-    fi
+    # --- FIX for repeated deferral failure ---
+    # The 'launchctl bootout' command (previously here) was terminating the
+    # script that was running it, preventing the new daemon from being created.
+    #
+    # The new, simplified logic is:
+    # 1. Remove any old .plist file.
+    # 2. Create the new .plist file with the new StartInterval.
+    # 3. Bootstrap (load) the new job.
+    # 4. When this script exits (0), the *old* running job (Daemon A) will see
+    #    'SuccessfulExit' and correctly stop (due to KeepAlive=false).
+    # 5. The *new* job (Daemon B) is now loaded and scheduled to run at the deferred time.
     
     # --- FIX: Use the Launch Daemon path ---
     if [ -f "$LAUNCH_DAEMON_PATH" ]; then
