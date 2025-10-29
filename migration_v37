@@ -231,7 +231,7 @@ remove_relaunch_agent() {
 }
 
 # ---
-# --- handle_deferral FUNCTION - NOW WITH JQ_BINARY FIX ---
+# --- handle_deferral FUNCTION - NOW WITH JQ_BINARY FIX & NEXTRUNEPOCH---
 # ---
 handle_deferral() {
     deferral_count=$((deferral_count + 1))
@@ -369,6 +369,18 @@ handle_deferral() {
             ;;
     esac
 
+    #
+    # --- SOLUTION: Part 1 (Write the deferral time) ---
+    #
+    # Calculate and store the *exact* future time.
+    local next_run_epoch
+    next_run_epoch=$((now_epoch + seconds_to_wait))
+    defaults write "$PLIST_PATH" NextRunEpoch -int "$next_run_epoch"
+    log "Storing next run epoch: $next_run_epoch (i.e., $(date -r $next_run_epoch))"
+    #
+    # --- END OF SOLUTION Part 1 ---
+    #
+
     # --- FIX: Pass seconds to schedule_relaunch ---
     schedule_relaunch "$seconds_to_wait"
     
@@ -379,14 +391,35 @@ handle_deferral() {
     
     # --- FIX for Issue #1 ---
     # Added explicit log message to confirm the script is exiting as intended.
-    # If the prompt reappears immediately after seeing this log, it means
-    # the Jamf Policy (not this script) is set to "Ongoing" and is re-running.
     log "Deferral scheduled successfully. The script will now exit."
     
     exit 0
 }
 
 check_deferral() {
+  #
+  # --- SOLUTION: Part 2 (Check the deferral time) ---
+  #
+  # Check if a deferral is *already active*
+  if [ -f "$PLIST_PATH" ]; then
+    local next_run_epoch
+    local now_epoch
+    # Read the stored epoch time, default to 0 if not found
+    next_run_epoch=$(defaults read "$PLIST_PATH" NextRunEpoch 2>/dev/null || echo 0)
+    now_epoch=$(date +%s)
+    
+    if [[ "$next_run_epoch" -gt "$now_epoch" ]]; then
+      # A deferral is active and the time has not yet passed.
+      # This script was likely re-triggered by Jamf. Exit silently.
+      local remaining_seconds=$((next_run_epoch - now_epoch))
+      log "Deferral is still active. Next run scheduled for $(date -r $next_run_epoch) ($remaining_seconds seconds from now). Script will exit."
+      exit 0
+    fi
+  fi
+  #
+  # --- END OF SOLUTION Part 2 ---
+  #
+  
   if [ ! -f "$PLIST_PATH" ]; then
     log "Plist not found. Creating with 0 deferrals."
     local plist_dir
@@ -395,6 +428,8 @@ check_deferral() {
     # Set ownership of the new directory to the user
     chown -R "$LOGGED_IN_USER" "$plist_dir"
     defaults write "$PLIST_PATH" DeferralCount -int 0
+    # --- SOLUTION: Initialize NextRunEpoch to 0 ---
+    defaults write "$PLIST_PATH" NextRunEpoch -int 0
     # Set ownership of the new plist to the user
     chown "$LOGGED_IN_USER" "$PLIST_PATH"
   fi
@@ -406,10 +441,16 @@ check_deferral() {
   if [ "$remaining_deferrals" -le 0 ]; then
     show_dialog_info "Mandatory Migration" "The migration is now mandatory and the process will begin automatically."
     remove_relaunch_agent # Clean up scheduler as it's no longer needed
+    # --- SOLUTION: Reset NextRunEpoch after mandatory migration ---
+    defaults write "$PLIST_PATH" NextRunEpoch -int 0
+    chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
   else
     if show_dialog_confirm "StratMac to LBG Business Migration" "This Mac is now due to migrate over to the new LBG Business build for Apple Mac devices.\n\n The entire process will take roughly 1 hour depending on your internet speed.\n\n You have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
         log "User chose to migrate."
         remove_relaunch_agent # Clean up scheduler
+        # --- SOLUTION: Reset NextRunEpoch on migration ---
+        defaults write "$PLIST_PATH" NextRunEpoch -int 0
+        chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
     else
         handle_deferral
     fi
@@ -729,7 +770,12 @@ trigger_remote_wipe() {
     
     if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]];
     then
-        success "EraseDevice command sent successfully (HTTP $http_status)."
+        success "EraseDevice command sent successfully (HTTP $http_stepstatus)."
+        # --- SOLUTION: Reset Deferral/Epoch counts on successful wipe command ---
+        log "Resetting deferral counts after successful wipe command."
+        defaults write "$PLIST_PATH" DeferralCount -int 0
+        defaults write "$PLIST_PATH" NextRunEpoch -int 0
+        chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
         exit 0
     else
         err "trigger_remote_wipe" "Failed to send EraseDevice command. HTTP status: $http_status"
@@ -746,6 +792,8 @@ main() {
   # setup_environment now checks for jq and dialog
   setup_environment
   check_hardware_support
+  
+  # --- SOLUTION: This function now contains the guard logic ---
   check_deferral
 
   # --- User Dialogs ---
