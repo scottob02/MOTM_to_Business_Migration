@@ -374,6 +374,12 @@ handle_deferral() {
     # We must also chown the plist, as this function may create it
     chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
     
+    # --- FIX for Issue #1 ---
+    # Added explicit log message to confirm the script is exiting as intended.
+    # If the prompt reappears immediately after seeing this log, it means
+    # the Jamf Policy (not this script) is set to "Ongoing" and is re-running.
+    log "Deferral scheduled successfully. The script will now exit."
+    
     exit 0
 }
 
@@ -649,7 +655,9 @@ get_computer_inventory_id() {
     http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
     response_body=$(echo "$response" | sed '$d')
 
-    if [[ "$http_s" -ne 200 ]];
+    # --- FIX for Issue #2 ---
+    # The variable was $http_s, which was a typo. Corrected to $http_status.
+    if [[ "$http_status" -ne 200 ]];
     then
         err "get_computer_inventory_id" "Jamf API request failed with HTTP status $http_status."
     fi
