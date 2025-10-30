@@ -22,7 +22,7 @@ fi
 MAX_DEFERRALS=5
 # LOGGED_IN_USER is now defined above
 PLIST_PATH="/Users/$LOGGED_IN_USER/Library/Application Support/LBG/com.lbg.jamf-migration.plist"
-LAUNCH_DAEMON_PATH="/Library/LaunchDaemons/com.lbg.jamf-migration.plist"
+# LAUNCH_DAEMON_PATH is no longer needed as we create unique ones.
 
 # --- SwiftDialog Settings ---
 DIALOG_BINARY="/usr/local/bin/dialog"
@@ -131,39 +131,27 @@ schedule_relaunch() {
     
     log "Scheduling relaunch for $seconds_to_wait seconds from now."
     
-    mkdir -p "$(dirname "$LAUNCH_DAEMON_PATH")"
+    # --- NEW: Create a unique label and path for the new daemon ---
+    local unique_id
+    unique_id=$(date +%s)
+    local new_label="com.lbg.jamf-migration.$unique_id"
+    local new_daemon_path="/Library/LaunchDaemons/$new_label.plist"
     
-    # This logic is:
-    # 1. UNLOAD (bootout) the *currently running* daemon.
-    # 2. Remove the old .plist file.
-    # 3. Bootstrap (load) the new job.
-    # 4. When this script exits (0), the *old* running job (Daemon A) will see
-    #    'SuccessfulExit' and correctly stop (due to KeepAlive=false).
-    # 5. The *new* job (Daemon B) is now loaded and scheduled to run at the deferred time.
+    log "Creating new daemon: $new_label"
     
-    if [ -f "$LAUNCH_DAEMON_PATH" ]; then
-        log "Unloading (booting out) existing daemon service..."
-        # We must explicitly unload the old service before bootstrapping
-        # the new one with the same label.
-        # We pipe to /dev/null because this command can return a
-        # non-zero exit code if the service isn't loaded (e.g., on the
-        # very first run from the Jamf policy), which is expected.
-        
-        # This is the fix: 'remove' de-registers the label without
-        # killing the currently running process, avoiding the crash.
-        launchctl remove com.lbg.jamf-migration &>/dev/null
-        
-        log "Removing existing daemon file."
-        rm "$LAUNCH_DAEMON_PATH"
-    fi
+    # We no longer need to remove/bootout/remove the old daemon.
+    # The current script (run by the old daemon) will exit 0, 
+    # and its daemon will stop itself (due to KeepAlive=false).
+    # We just create and load the *new* one.
 
-    cat << EOF > "$LAUNCH_DAEMON_PATH"
+    cat << EOF > "$new_daemon_path"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.lbg.jamf-migration</string>
+    <!-- Use the new unique label -->
+    <string>$new_label</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
@@ -214,24 +202,49 @@ schedule_relaunch() {
 </plist>
 EOF
 
-    chown root:wheel "$LAUNCH_DAEMON_PATH"
-    chmod 644 "$LAUNCH_DAEMON_PATH"
+    chown root:wheel "$new_daemon_path"
+    chmod 644 "$new_daemon_path"
 
-    # Now that the old service is unloaded, this bootstrap will succeed.
-    if ! launchctl bootstrap "system" "$LAUNCH_DAEMON_PATH"; then
-      err "schedule_relaunch" "Failed to bootstrap (load) the Launch Daemon!"
+    # Now we just bootstrap the new, unique daemon.
+    if ! launchctl bootstrap "system" "$new_daemon_path"; then
+      err "schedule_relaunch" "Failed to bootstrap (load) the new Launch Daemon!"
     else
-      success "Launch Daemon successfully loaded (bootstrapped)."
+      success "Launch Daemon $new_label successfully loaded (bootstrapped)."
     fi
     log "Launch Daemon loaded and scheduled to run policy $JAMF_POLICY_ID."
 }
 
 remove_relaunch_agent() {
-    if [ -f "$LAUNCH_DAEMON_PATH" ]; then
-        log "Removing relaunch daemon."
-        launchctl bootout "system/$LAUNCH_DAEMON_PATH" &>/dev/null
-        rm "$LAUNCH_DAEMON_PATH"
+    log "Cleaning up all relaunch daemons..."
+    
+    # Find all daemons matching the pattern "com.lbg.jamf-migration*.plist"
+    local daemon_files
+    daemon_files=$(find /Library/LaunchDaemons/ -name "com.lbg.jamf-migration*.plist" -type f 2>/dev/null)
+    
+    if [ -z "$daemon_files" ]; then
+        log "No matching daemons found to remove."
+        return
     fi
+    
+    for daemon_path in $daemon_files; do
+        local label
+        # Extract label from filename (e.g., /Lib.../com.lbg.jamf-migration.123.plist -> com.lbg.jamf-migration.123)
+        label=$(basename "$daemon_path" .plist)
+        
+        log "Removing daemon: $label (Path: $daemon_path)"
+        
+        # Unload the service. Pipe to /dev/null as it's fine if it's not loaded.
+        # Use the label for bootout, not the path
+        launchctl bootout "system/$label" &>/dev/null
+        
+        # Remove the file
+        if [ -f "$daemon_path" ]; then
+            rm "$daemon_path"
+            log "Removed file: $daemon_path"
+        fi
+    done
+    
+    success "Daemon cleanup complete."
 }
 
 handle_deferral() {
