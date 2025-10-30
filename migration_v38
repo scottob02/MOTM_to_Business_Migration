@@ -1,0 +1,799 @@
+#!/bin/zsh
+
+#
+# ─── PRE-FLIGHT USER CHECK ───────────────────────────────────────────────────
+#
+# This script must run as root, but *interact* with the logged-in user.
+# If no user is logged in (e.g., at the login window), we must exit non-zero.
+# Exiting non-zero (e.g., exit 1) tells the Launch Daemon to *retry*
+# (based on ThrottleInterval) instead of succeeding and disabling itself.
+#
+LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
+if [ -z "$LOGGED_IN_USER" ]; then
+    echo "[$(date)] [WARN] Migration script triggered, but no user is logged in. Exiting 1 to force retry." | tee -a "/var/log/com.lbg.jamf-migration.out.log"
+    exit 1
+fi
+
+#
+# ─── SCRIPT CONFIGURATION ─────────────────────────────────────────────────────
+#
+
+# --- Deferral Settings ---
+MAX_DEFERRALS=5
+# LOGGED_IN_USER is now defined above
+PLIST_PATH="/Users/$LOGGED_IN_USER/Library/Application Support/LBG/com.lbg.jamf-migration.plist"
+LAUNCH_DAEMON_PATH="/Library/LaunchDaemons/com.lbg.jamf-migration.plist"
+
+# --- SwiftDialog Settings ---
+DIALOG_BINARY="/usr/local/bin/dialog"
+JQ_BINARY="/usr/bin/jq"
+BRANDING_ICON="/Users/Shared/LBG_Branding_Cancara/lbg_primary_logo.png" 
+
+# --- Jamf API Credentials & Endpoints ---
+JAMF_CLIENT_ID="${4:-$JAMF_CLIENT_ID}"
+JAMF_CLIENT_SECRET="${5:-$JAMF_CLIENT_SECRET}"
+ORIGIN_JAMF_URL="${6:-$ORIGIN_JAMF_URL}"
+TARGET_JAMF_URL="${7:-$TARGET_JAMF_URL}"
+DRY_RUN="${8:-${DRY_RUN:-false}}"
+JAMF_POLICY_ID="${9:-$JAMF_POLICY_ID}"
+
+# --- Global Variables ---
+management_id=""
+computer_id=""
+
+#
+# ─── LOGGING AND UTILITIES ────────────────────────────────────────────────────
+#
+
+# LOG_FILE must be defined *after* LOGGED_IN_USER
+LOG_FILE="/Users/$LOGGED_IN_USER/jamf_migration_preflight.log"
+RED='\033[0;31m';
+GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0;33m'
+
+log() {
+  printf '%b[%s] [INFO]  %s%b\n' \
+    "$YELLOW" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" |
+  tee -a "$LOG_FILE"
+}
+
+success() {
+  printf '%b[%s] [SUCCESS] %s%b\n' \
+    "$GREEN" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" |
+  tee -a "$LOG_FILE"
+}
+
+err() {
+  local caller="$1"
+  local message="$2"
+  printf '%b[%s] [ERROR] [%s] %s%b\n' \
+    "$RED" "$(date '+%Y-%m-%dT%H:%M:%S')" "$caller" "$message" "$NC" |
+  tee -a "$LOG_FILE" >&2
+  show_dialog_error "[$caller] $message"
+  exit 1
+}
+
+run_cmd() {
+  if $dry_run && [[ "$1" == "kill" ]];
+  then
+    log "[DRY-RUN] Would execute: $*"
+  else
+    "$@"
+  fi
+}
+
+urlencode() {
+    local string="${1}"
+    local strlen=${#string}
+    local encoded=""
+    local pos c o
+
+    for (( pos=0 ; pos<strlen ; pos++ ));
+    do
+        c=${string:$pos:1}
+        case "$c" in
+            [-_.~a-zA-Z0-9] ) o="${c}" ;;
+            * )               printf -v o '%%%02x' "'$c"
+        esac
+        encoded+="${o}"
+    done
+    echo "${encoded}"
+}
+
+
+#
+# ─── SWIFTDIALOG FUNCTIONS ────────────────────────────────────────────────────
+#
+
+show_dialog_error() {
+  "$DIALOG_BINARY" --title "Migration Error" --message "$1" --icon "SF=xmark.octagon.fill,colour=red" \
+    --button1text "Close" --width 450 --height 250 --messagefont "size=12"
+}
+
+show_dialog_info() {
+    "$DIALOG_BINARY" --title "$1" --message "$2" --icon "$BRANDING_ICON" \
+      --button1text "OK" --width 450 --height 250 --messagefont "size=12"
+}
+
+show_dialog_confirm() {
+   
+   "$DIALOG_BINARY" --title "$1" --message "$2" --icon "$BRANDING_ICON" \
+      --button1text "${3:-Proceed}" --button2text "${4:-Cancel}" --width 550 --height 350 --messagefont "size=12"
+    return $?
+}
+
+
+#
+# ─── DEFERRAL & SCHEDULING FUNCTIONS ──────────────────────────────────────────
+#
+
+schedule_relaunch() {
+    local seconds_to_wait=$1
+    
+    log "Scheduling relaunch for $seconds_to_wait seconds from now."
+    
+    mkdir -p "$(dirname "$LAUNCH_DAEMON_PATH")"
+    
+    # This logic is:
+    # 1. UNLOAD (bootout) the *currently running* daemon.
+    # 2. Remove the old .plist file.
+    # 3. Bootstrap (load) the new job.
+    # 4. When this script exits (0), the *old* running job (Daemon A) will see
+    #    'SuccessfulExit' and correctly stop (due to KeepAlive=false).
+    # 5. The *new* job (Daemon B) is now loaded and scheduled to run at the deferred time.
+    
+    if [ -f "$LAUNCH_DAEMON_PATH" ]; then
+        log "Unloading (booting out) existing daemon service..."
+        # We must explicitly unload the old service before bootstrapping
+        # the new one with the same label.
+        # We pipe to /dev/null because this command can return a
+        # non-zero exit code if the service isn't loaded (e.g., on the
+        # very first run from the Jamf policy), which is expected.
+        launchctl bootout "system/$LAUNCH_DAEMON_PATH" &>/dev/null
+        log "Removing existing daemon file."
+        rm "$LAUNCH_DAEMON_PATH"
+    fi
+
+    cat << EOF > "$LAUNCH_DAEMON_PATH"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lbg.jamf-migration</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <!--
+          This command runs the policy again.
+          The 'KeepAlive = { SuccessfulExit = false }' key
+          handles the deferral case:
+          1. User defers.
+          2. schedule_relaunch creates a *new* daemon for a future time.
+          3. This script exits 0 (success).
+          4. This *current* daemon job sees the "SuccessfulExit" and stops,
+             allowing the *new* one to take over.
+        -->
+        <string>/usr/local/bin/jamf policy -id $JAMF_POLICY_ID</string>
+    </array>
+    
+    <!--
+      StartInterval runs the job N seconds from when it's loaded,
+      and *will* run on wake if the interval was missed while asleep.
+      Since the script re-runs and re-loads this daemon on every
+      deferral, it effectively acts as a "run once in N seconds" timer.
+    -->
+    <key>StartInterval</key>
+    <integer>$seconds_to_wait</integer>
+    
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    
+    <!--
+      ThrottleInterval controls the retry loop if the job exits non-zero.
+      This is now used by our "no user logged in" check.
+    -->
+    <key>ThrottleInterval</key>
+    <integer>600</integer>
+    
+    <key>StandardOutPath</key>
+    <string>/var/log/com.lbg.jamf-migration.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/com.lbg.jamf-migration.err.log</string>
+    
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+EOF
+
+    chown root:wheel "$LAUNCH_DAEMON_PATH"
+    chmod 644 "$LAUNCH_DAEMON_PATH"
+
+    # Now that the old service is unloaded, this bootstrap will succeed.
+    if ! launchctl bootstrap "system" "$LAUNCH_DAEMON_PATH"; then
+      err "schedule_relaunch" "Failed to bootstrap (load) the Launch Daemon!"
+    else
+      success "Launch Daemon successfully loaded (bootstrapped)."
+    fi
+    log "Launch Daemon loaded and scheduled to run policy $JAMF_POLICY_ID."
+}
+
+remove_relaunch_agent() {
+    if [ -f "$LAUNCH_DAEMON_PATH" ]; then
+        log "Removing relaunch daemon."
+        launchctl bootout "system/$LAUNCH_DAEMON_PATH" &>/dev/null
+        rm "$LAUNCH_DAEMON_PATH"
+    fi
+}
+
+handle_deferral() {
+    deferral_count=$((deferral_count + 1))
+    defaults write "$PLIST_PATH" DeferralCount -int "$deferral_count"
+    log "User deferred. New count: $deferral_count."
+
+    local future_hour future_minute friendly_time
+    local seconds_to_wait
+    local now_epoch
+    now_epoch=$(date +%s)
+    
+    local current_hour
+    current_hour=$(date +%H)
+    
+    # 1. Capture the JSON output from swiftDialog
+    local defer_choice_json
+    defer_choice_json=$("$DIALOG_BINARY" --title "Choose Deferral Time" \
+      --message "When should we remind you? This prompt will reappear at the time you select." \
+      --icon "$BRANDING_ICON" --width 450 --height 250 --messagefont "size=12" \
+      --selecttitle "Deferral Options" \
+      --selectvalues "1h: Remind me in 1 Hour, 2h: Remind me in 2 Hours, 4h: Remind me in 4 Hours, 12pm: Defer until 12:00 PM, 5pm: Defer until 5:00 PM, 9am: Defer until 9:00 AM" \
+      --selectdefault "1h" \
+      --button1text "Confirm Deferral" \
+      --json)
+    
+    # 2. Check for "Cancel" (non-zero exit code)
+    [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
+    
+    # 3. Log the raw JSON output for debugging
+    log "Raw JSON from dialog: $defer_choice_json"
+    
+    # 4. Parse the JSON to get the *actual* key (e.g., "1h")
+    local defer_choice
+    defer_choice=$("$JQ_BINARY" -r '.["Deferral Options"].selectedValue | split(":")[0]' <<< "$defer_choice_json")
+    
+    log "Parsed defer_choice from swiftDialog JSON: '$defer_choice'"
+    
+    case "$defer_choice" in
+        "1h")
+            seconds_to_wait=3600
+            
+            if [[ "$(date -v+1H +%d)" == "$(date +%d)" ]]; then
+                friendly_time=$(date -v+1H +"today at %-I:%M %p")
+            else
+                friendly_time=$(date -v+1H +"tomorrow at %-I:%M %p")
+            fi
+            log "User chose to defer for 1 hour (3600s)."
+            ;;
+        "2h")
+            seconds_to_wait=7200
+
+            if [[ "$(date -v+2H +%d)" == "$(date +%d)" ]]; then
+                friendly_time=$(date -v+2H +"today at %-I:%M %p")
+            else
+                friendly_time=$(date -v+2H +"tomorrow at %-I:%M %p")
+            fi
+            log "User chose to defer for 2 hours (7200s)."
+            ;;
+        "4h")
+            seconds_to_wait=14400
+
+            if [[ "$(date -v+4H +%d)" == "$(date +%d)" ]]; then
+                friendly_time=$(date -v+4H +"today at %-I:%M %p")
+            else
+                friendly_time=$(date -v+4H +"tomorrow at %-I:%M %p")
+            fi
+            log "User chose to defer for 4 hours (14400s)."
+            ;;
+        "12pm")
+            local target_epoch
+            target_epoch=$(date -j -v12H -v0M -v0S +%s) # 12:00:00 today
+            if [[ "$now_epoch" -ge "$target_epoch" ]]; then
+                # 12pm has passed today, schedule for 12pm tomorrow
+                target_epoch=$(date -j -v+1d -v12H -v0M -v0S +%s)
+                friendly_time=$(date -v+1d +"tomorrow at 12:00 PM")
+            else
+                friendly_time="today at 12:00 PM"
+            fi
+            seconds_to_wait=$((target_epoch - now_epoch))
+            log "User chose to defer until 12 PM ($seconds_to_wait seconds)."
+            ;;
+        "5pm")
+            local target_epoch
+            target_epoch=$(date -j -v17H -v0M -v0S +%s) # 5:00:00 PM today
+            if [[ "$now_epoch" -ge "$target_epoch" ]]; then
+                # 5pm has passed today, schedule for 5pm tomorrow
+                target_epoch=$(date -j -v+1d -v17H -v0M -v0S +%s)
+                friendly_time=$(date -v+1d +"tomorrow at 5:00 PM")
+            else
+                friendly_time="today at 5:00 PM"
+            fi
+            seconds_to_wait=$((target_epoch - now_epoch))
+            log "User chose to defer until 5 PM ($seconds_to_wait seconds)."
+            ;;
+        "9am")
+            local target_epoch
+            target_epoch=$(date -j -v9H -v0M -v0S +%s) # 9:00:00 AM today
+            if [[ "$now_epoch" -ge "$target_epoch" ]]; then
+                # 9am has passed today, schedule for 9am tomorrow
+                target_epoch=$(date -j -v+1d -v9H -v0M -v0S +%s)
+                friendly_time=$(date -v+1d +"tomorrow at 9:00 AM")
+            else
+                friendly_time="today at 9:00 AM"
+            fi
+            seconds_to_wait=$((target_epoch - now_epoch))
+            log "User chose to defer until 9 AM ($seconds_to_wait seconds)."
+            ;;
+        *)
+            log "Invalid deferral choice received: '$defer_choice'. Defaulting to 1 hour."
+            seconds_to_wait=3600
+            
+            if [[ "$(date -v+1H +%d)" == "$(date +%d)" ]]; then
+                friendly_time=$(date -v+1H +"today at %-I:%M %p")
+            else
+                friendly_time=$(date -v+1H +"tomorrow at %-I:%M %p")
+            fi
+            ;;
+    esac
+
+    # Calculate and store the *exact* future time.
+    local next_run_epoch
+    next_run_epoch=$((now_epoch + seconds_to_wait))
+    defaults write "$PLIST_PATH" NextRunEpoch -int "$next_run_epoch"
+    log "Storing next run epoch: $next_run_epoch (i.e., $(date -r $next_run_epoch))"
+
+    schedule_relaunch "$seconds_to_wait"
+    
+    show_dialog_info "Migration Deferred" "You will be reminded $friendly_time."
+    
+    # We must also chown the plist, as this function may create it
+    chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
+    
+    log "Deferral scheduled successfully. The script will now exit."
+    
+    exit 0
+}
+
+check_deferral() {
+  # Check if a deferral is *already active*
+  if [ -f "$PLIST_PATH" ]; then
+    local next_run_epoch
+    local now_epoch
+    # Read the stored epoch time, default to 0 if not found
+    next_run_epoch=$(defaults read "$PLIST_PATH" NextRunEpoch 2>/dev/null || echo 0)
+    now_epoch=$(date +%s)
+    
+    if [[ "$next_run_epoch" -gt "$now_epoch" ]]; then
+      # A deferral is active and the time has not yet passed.
+      # This script was likely re-triggered by Jamf. Exit silently.
+      local remaining_seconds=$((next_run_epoch - now_epoch))
+      log "Deferral is still active. Next run scheduled for $(date -r $next_run_epoch) ($remaining_seconds seconds from now). Script will exit."
+      exit 0
+    fi
+  fi
+  
+  if [ ! -f "$PLIST_PATH" ]; then
+    log "Plist not found. Creating with 0 deferrals."
+    local plist_dir
+    plist_dir=$(dirname "$PLIST_PATH")
+    mkdir -p "$plist_dir"
+    # Set ownership of the new directory to the user
+    chown -R "$LOGGED_IN_USER" "$plist_dir"
+    defaults write "$PLIST_PATH" DeferralCount -int 0
+    defaults write "$PLIST_PATH" NextRunEpoch -int 0
+    # Set ownership of the new plist to the user
+    chown "$LOGGED_IN_USER" "$PLIST_PATH"
+  fi
+  
+  deferral_count=$(defaults read "$PLIST_PATH" DeferralCount 2>/dev/null || echo 0)
+  remaining_deferrals=$((MAX_DEFERRALS - deferral_count))
+
+  log "Deferral count: $deferral_count. Remaining: $remaining_deferrals."
+  if [ "$remaining_deferrals" -le 0 ]; then
+    show_dialog_info "Mandatory Migration" "The migration is now mandatory and the process will begin automatically."
+    remove_relaunch_agent # Clean up scheduler as it's no longer needed
+    defaults write "$PLIST_PATH" NextRunEpoch -int 0
+    chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
+  else
+    if show_dialog_confirm "StratMac to LBG Business Migration" "This Mac is now due to migrate over to the new LBG Business build for Apple Mac devices.\n\n The entire process will take roughly 1 hour depending on your internet speed.\n\n You have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
+        log "User chose to migrate."
+        remove_relaunch_agent # Clean up scheduler
+        defaults write "$PLIST_PATH" NextRunEpoch -int 0
+        chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
+    else
+        handle_deferral
+    fi
+  fi
+}
+
+show_requirements_dialog() {
+    local message
+    message="To ensure a smooth migration to LBG Business, please verify the following requirements before you continue:\n\n"
+    message+="* **Power:** Your Mac must be connected to a power source.\n"
+    message+="* **Internet:** A stable internet connection throughout the entire migration is required.\n"
+    message+="* **Data Backed-up:** Any information, files, or notes you wish 
+to keep must be saved and uploaded to OneDrive. Anything not stored in OneDrive will be permanetly deleted. \n\n"
+    message+="Additionally this process will close all open applications and then perform a factory reset which will wipe all data from this Mac."
+    if ! show_dialog_confirm "Migration Requirements" "$message" "I Understand, Continue" "Cancel";
+    then
+        log "User cancelled at the requirements screen."
+        exit 0
+    fi
+}
+
+show_data_backup_dialog() {
+    local message
+    message="**FINAL DATA WARNING**
+
+This is your final confirmation that **all data on this Mac will be permanently erased.**
+
+- This action **cannot be undone**.
+- Only files you have saved and **fully synced to OneDrive** will be available after the migration.
+
+Please double-check that OneDrive has finished syncing all your important files."
+    if ! "$DIALOG_BINARY" --title "Have You Synced All Your Data?" \
+        --message "$message" \
+        --icon "SF=exclamationmark.triangle.fill,colour=red" \
+        --button1text "I confirm I have synced everything I need" \
+        --button2text "Cancel" \
+        --width 650 --height 350 --messagefont "size=14";
+    then
+        log "User cancelled at the final data backup warning screen."
+        exit 0
+    fi
+    success "User has explicitly confirmed data backup and accepts erasure."
+}
+
+
+#
+# ─── ENVIRONMENT & PREFLIGHT CHECKS ───────────────────────────────────────────
+#
+
+setup_environment() {
+    # Validate required parameters
+    local missing_params=false
+    local error_msg="Missing required parameters:"
+
+    if [ -z "$JAMF_CLIENT_ID" ];
+    then error_msg+="\n- JAMF_CLIENT_ID"; missing_params=true; fi
+    if [ -z "$JAMF_CLIENT_SECRET" ]; then error_msg+="\n- JAMF_CLIENT_SECRET"; missing_params=true;
+    fi
+    if [ -z "$ORIGIN_JAMF_URL" ]; then error_msg+="\n- ORIGIN_JAMF_URL"; missing_params=true;
+    fi
+    if [ -z "$TARGET_JAMF_URL" ]; then error_msg+="\n- TARGET_JAMF_URL"; missing_params=true;
+    fi
+    if [ -z "$JAMF_POLICY_ID" ]; then error_msg+="\n- JAMF_POLICY_ID (e.g., 123)"; missing_params=true;
+    fi
+
+    if $missing_params; then
+      err "setup_environment" "$error_msg"
+    fi
+    
+    if [[ ! -x "$DIALOG_BINARY" ]]; then
+      err "setup_environment" "swiftDialog not found at $DIALOG_BINARY. Please install it."
+    fi
+    if [[ ! -x "$JQ_BINARY" ]]; then
+      err "setup_environment" "jq not found at $JQ_BINARY. Please install it."
+    fi
+    success "Required binaries (dialog, jq) found."
+
+    client_id="$JAMF_CLIENT_ID"
+    client_secret="$JAMF_CLIENT_SECRET"
+    origin_jamf_url="${ORIGIN_JAMF_URL%/}"
+    target_jamf_url="${TARGET_JAMF_URL%/}"
+    dry_run=$(echo "$DRY_RUN" | tr '[:upper:]' '[:lower:]')
+    [[ "$dry_run" == "true" ]] && dry_run=true || dry_run=false
+
+    log_dir=$(dirname "$LOG_FILE")
+    mkdir -p "$log_dir" 2>/dev/null
+    touch "$LOG_FILE" 2>/dev/null
+    
+    serial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
+    [ -z "$serial" ] && err "setup_environment" "Could not determine serial number."
+}
+
+check_hardware_support() {
+    log "Checking hardware for Apple Silicon..."
+    if ! sysctl -n machdep.cpu.brand_string | grep -q "Apple"; then
+        err "check_hardware_support" "This device is not an Apple Silicon Mac and is no longer supported. Please follow the process to order a new device."
+    fi
+    success "Apple Silicon Mac detected. Device is supported."
+}
+
+check_os_version() {
+    log "Checking macOS version for local erase eligibility..."
+    OS_VERSION=$(sw_vers -productVersion)
+    local os_major_version
+    os_major_version=$(echo "$OS_VERSION" | awk -F. '{print $1}')
+
+    if [[ "$os_major_version" -lt 12 ]];
+    then
+        err "check_os_version" "macOS version ($OS_VERSION) is older than macOS 12. Local 'Erase All Content and Settings' is not supported."
+    else
+        success "macOS version ($OS_VERSION) supports local erase."
+    fi
+}
+
+get_connection_type() {
+  log "Determining active network service…"
+  
+  # Extract the hostname from the origin Jamf URL
+  local jamf_host
+  jamf_host=$(echo "$origin_jamf_url" | awk -F/ '{print $3}')
+
+  if ! curl -s --head --connect-timeout 5 "$origin_jamf_url" >/dev/null 2>&1; then
+      err "get_connection_type" "No connectivity to your Jamf server ($jamf_host). Migration requires an active internet connection to the Jamf server."
+  else
+    success "Jamf connectivity check passed. ($jamf_host is reachable)"
+  fi
+}
+
+
+check_device_power_type() {
+  log "Checking power source..."
+  if ! pmset -g batt | grep -q "AC Power"; then
+      err "check_device_power_type" "Device is not connected to AC power. Please connect your power adapter to continue."
+  else
+    success "Device is connected to AC power."
+  fi
+}
+
+check_mdm_profile() {
+  log "Checking for active MDM profile..."
+  if ! profiles status -type enrollment | grep -q "Enrolled via DEP:"; then
+      err "check_mdm_profile" "No active MDM profile was detected. This device must be enrolled in MDM to proceed."
+  else
+    success "Active MDM profile detected."
+  fi
+}
+
+check_jamf_enrollment() {
+  log "Verifying current Jamf Pro enrollment status..."
+  if [[ ! -f "/usr/local/jamf/bin/jamf" ]]; then
+      err "check_jamf_enrollment" "Jamf binary not found - device not enrolled in any Jamf Pro instance."
+  else
+    local current_jss_url
+    current_jss_url=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)
+    
+    if [[ "$current_jss_url" == "$target_jamf_url"* ]];
+    then
+      err "check_jamf_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary."
+    elif [[ "$current_jss_url" != "$origin_jamf_url"* ]]; then
+      log "WARN: Device is enrolled in neither the origin nor target Jamf instance. Current: $current_jss_url"
+    else
+      success "Confirmed device is enrolled in origin Jamf instance."
+    fi
+  fi
+}
+
+kill_user_apps() {
+  local excluded_patterns=("Self Service" "Terminal" "Finder" "dialog" "jamf" "Jamf" "Symantec" "WSS")
+  log "Starting graceful application termination..."
+  
+  local app_pids=()
+  ps -ax -o pid,command | grep "/Applications/.*\.app/" | grep -v grep | while read -r pid command;
+  do
+    local app_name
+    app_name=$(echo "$command" | sed -E 's|.*/Applications/([^/]+)\.app/.*|\1|')
+    local excluded=false
+    for pattern in "${excluded_patterns[@]}";
+    do
+      if [[ "$app_name" == *"$pattern"* ]];
+      then
+        excluded=true
+        break
+      fi
+    done
+    
+    if ! $excluded; then
+      log "Gracefully terminating $app_name (PID: $pid)"
+      run_cmd osascript -e "tell application \"$app_name\" to quit" &>/dev/null &
+      app_pids+=("$pid")
+    fi
+  done
+  
+  sleep 3
+  for pid in "${app_pids[@]}";
+  do
+    if kill -0 "$pid" &>/dev/null; then
+      log "Force killing PID: $pid"
+      run_cmd kill -9 "$pid"
+    fi
+  done
+}
+
+check_apns_connectivity() {
+  log "Checking connectivity to Apple Push Notification Service (APNs)..."
+  if nc -z -G 3 api.push.apple.com 443;
+  then
+    success "APNs hostname (api.push.apple.com) is reachable on port 443."
+  else
+      err "check_apns_connectivity" "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail."
+  fi
+}
+
+
+#
+# ─── JAMF PRO API FUNCTIONS ───────────────────────────────────────────────────
+#
+
+get_jamf_auth_token() {
+  log "Getting API token from origin Jamf..."
+  response=$(
+    curl -s -X POST "$origin_jamf_url/api/v1/oauth/token" \
+      -H "accept: application/json" \
+      -H "content-type: application/x-www-form-urlencoded" \
+      -d "grant_type=client_credentials&client_id=$client_id&client_secret=$client_secret"
+  )
+  bearer_token=$(echo "$response" | "$JQ_BINARY" -r '.access_token')
+  
+  [[ -z "$bearer_token" || "$bearer_token" == "null" ]] && err "get_jamf_auth_token" "Failed to get API token from Jamf Pro."
+  success "API token obtained successfully."
+}
+
+get_computer_inventory_id() {
+    log "Looking up device by serial: '$serial'"
+    local filter="hardware.serialNumber==\"$serial\""
+    local filter_encoded
+    filter_encoded=$(urlencode "$filter")
+
+    response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+        -H "Authorization: Bearer $bearer_token" \
+        "$origin_jamf_url/api/v1/computers-inventory?section=GENERAL&filter=${filter_encoded}")
+    
+    http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
+    response_body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_status" -ne 200 ]];
+    then
+        err "get_computer_inventory_id" "Jamf API request failed with HTTP status $http_status."
+    fi
+
+    computer_id=$(echo "$response_body" | "$JQ_BINARY" -r '.results[0].id')
+    management_id=$(echo "$response_body" | "$JQ_BINARY" -r '.results[0].general.managementId')
+    
+    [[ -z "$computer_id" || "$computer_id" == "null" ]] && err "get_computer_inventory_id" "Computer ID not found in Jamf Pro API response."
+    [[ -z "$management_id" || "$management_id" == "null" ]] && err "get_computer_inventory_id" "Management ID not found in Jamf Pro API response."
+    success "Found Computer ID: $computer_id and Management ID: $management_id"
+}
+
+clear_failed_commands() {
+  log "Clearing any existing failed or pending commands in Jamf Pro..."
+  local payload='{"statuses": ["FAILED", "PENDING"]}'
+  
+  response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+    "$origin_jamf_url/api/v1/computers-inventory/$computer_id/commands/flush" \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -d "$payload")
+
+  http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
+  
+  if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]];
+  then
+    success "Successfully cleared failed/pending commands (HTTP $http_status)."
+  else
+    log "WARN: Could not clear failed commands (HTTP $http_status). This is non-critical, proceeding anyway."
+  fi
+}
+
+trigger_remote_wipe() {
+    log "Initiating remote wipe via Jamf Pro API v2..."
+    
+    if $dry_run;
+    then
+        log "[DRY-RUN] Would have sent EraseDevice command for management ID $management_id."
+        success "[DRY-RUN] Remote wipe would have been initiated."
+        return
+    fi
+    
+    show_dialog_info "Wipe Command Sent" "The remote wipe command has been sent to this Mac. It will restart and erase itself shortly."
+    
+    local payload
+    payload=$(printf '{
+      "commandData": {
+        "commandType": "ERASE_DEVICE",
+        "obliterationBehavior": "Default",
+        "pin": "123456"
+      },
+      "clientData": [{"managementId": "%s"}]
+    }' "$management_id")
+
+    response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+     "$origin_jamf_url/api/v2/mdm/commands" \
+        -H "Authorization: Bearer $bearer_token" \
+        -H "Content-Type: application/json" \
+        -d "$payload")
+
+    http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
+    
+    if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]];
+    then
+        success "EraseDevice command sent successfully (HTTP $http_status)."
+        log "Resetting deferral counts after successful wipe command."
+        defaults write "$PLIST_PATH" DeferralCount -int 0
+        defaults write "$PLIST_PATH" NextRunEpoch -int 0
+        chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
+        exit 0
+    else
+        err "trigger_remote_wipe" "Failed to send EraseDevice command. HTTP status: $http_status"
+    fi
+}
+
+
+#
+# ─── MAIN EXECUTION ───────────────────────────────────────────────────────────
+#
+
+main() {
+  # Note: The LOGGED_IN_USER check is now at the very top of the script.
+  
+  # --- Initial Setup & Critical Checks ---
+  setup_environment
+  check_hardware_support
+  
+  # This function now contains the guard logic for active deferrals
+  check_deferral
+
+  # --- User Dialogs ---
+  show_requirements_dialog
+  show_data_backup_dialog
+
+  # --- Run all preflight checks ---
+  log "Starting pre-flight checks..."
+  check_os_version
+  check_device_power_type
+  get_connection_type
+  check_apns_connectivity
+  check_jamf_enrollment
+  check_mdm_profile
+  
+  log "All pre-flight checks passed."
+  # --- Get Jamf Info ---
+  get_jamf_auth_token
+  get_computer_inventory_id
+  clear_failed_commands
+
+  # --- Final Warning & App Kill ---
+  if ! "$DIALOG_BINARY" --title "⚠️ POINT OF NO RETURN" \
+    --message "This is your final confirmation.
+
+Clicking the button below will immediately:
+1. Close all running applications.
+2. Send the command to **permanently erase all data** from this Mac.
+
+This action cannot be undone." \
+    --icon "SF=exclamationmark.triangle.fill,colour=orange" \
+    --button1text "I understand, Migrate to LBG Business" \
+    --button2text "Cancel" \
+    --width 600 --height 350 --messagefont "size=14";
+  then
+    log "User cancelled at final warning."
+    exit 0
+  fi
+  
+  kill_user_apps
+
+  # --- Execute Wipe ---
+  if $dry_run;
+  then
+    success "[DRY-RUN] Migration would have proceeded. Device wipe command not sent."
+    show_dialog_info "Dry-Run Complete" "All checks passed successfully. In a real run, the wipe command would have been sent."
+  else
+    trigger_remote_wipe
+  fi
+}
+
+main "$@"
