@@ -1,19 +1,31 @@
 #!/bin/zsh
 
 #
+# ─── PRE-FLIGHT USER CHECK ───────────────────────────────────────────────────
+#
+# This script must run as root, but *interact* with the logged-in user.
+# If no user is logged in (e.g., at the login window), we must exit non-zero.
+# Exiting non-zero (e.g., exit 1) tells the Launch Daemon to *retry*
+# (based on ThrottleInterval) instead of succeeding and disabling itself.
+#
+LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
+if [ -z "$LOGGED_IN_USER" ]; then
+    echo "[$(date)] [WARN] Migration script triggered, but no user is logged in. Exiting 1 to force retry." | tee -a "/var/log/com.lbg.jamf-migration.out.log"
+    exit 1
+fi
+
+#
 # ─── SCRIPT CONFIGURATION ─────────────────────────────────────────────────────
 #
 
 # --- Deferral Settings ---
 MAX_DEFERRALS=5
-LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
+# LOGGED_IN_USER is now defined above
 PLIST_PATH="/Users/$LOGGED_IN_USER/Library/Application Support/LBG/com.lbg.jamf-migration.plist"
-# --- FIX: Changed to a Launch Daemon path for root privileges ---
 LAUNCH_DAEMON_PATH="/Library/LaunchDaemons/com.lbg.jamf-migration.plist"
 
 # --- SwiftDialog Settings ---
 DIALOG_BINARY="/usr/local/bin/dialog"
-# --- FIX: Define the full path to jq ---
 JQ_BINARY="/usr/bin/jq"
 BRANDING_ICON="/Users/Shared/LBG_Branding_Cancara/lbg_primary_logo.png" 
 
@@ -33,6 +45,7 @@ computer_id=""
 # ─── LOGGING AND UTILITIES ────────────────────────────────────────────────────
 #
 
+# LOG_FILE must be defined *after* LOGGED_IN_USER
 LOG_FILE="/Users/$LOGGED_IN_USER/jamf_migration_preflight.log"
 RED='\033[0;31m';
 GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0;33m'
@@ -113,23 +126,14 @@ show_dialog_confirm() {
 # ─── DEFERRAL & SCHEDULING FUNCTIONS ──────────────────────────────────────────
 #
 
-# ---
-# --- FIX: THIS ENTIRE FUNCTION HAS BEEN REPLACED ---
-# ---
 schedule_relaunch() {
-    # --- FIX: This function now accepts seconds_to_wait ---
     local seconds_to_wait=$1
     
     log "Scheduling relaunch for $seconds_to_wait seconds from now."
     
-    # --- FIX: Use the Launch Daemon path ---
     mkdir -p "$(dirname "$LAUNCH_DAEMON_PATH")"
     
-    # --- FIX for repeated deferral failure ---
-    # The 'launchctl bootout' command (previously here) was terminating the
-    # script that was running it, preventing the new daemon from being created.
-    #
-    # The new, simplified logic is:
+    # This logic is:
     # 1. Remove any old .plist file.
     # 2. Create the new .plist file with the new StartInterval.
     # 3. Bootstrap (load) the new job.
@@ -137,13 +141,11 @@ schedule_relaunch() {
     #    'SuccessfulExit' and correctly stop (due to KeepAlive=false).
     # 5. The *new* job (Daemon B) is now loaded and scheduled to run at the deferred time.
     
-    # --- FIX: Use the Launch Daemon path ---
     if [ -f "$LAUNCH_DAEMON_PATH" ]; then
         log "Removing existing daemon file."
         rm "$LAUNCH_DAEMON_PATH"
     fi
 
-    # --- FIX: Create the Launch Daemon plist ---
     cat << EOF > "$LAUNCH_DAEMON_PATH"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -155,12 +157,8 @@ schedule_relaunch() {
     <array>
         <string>/bin/zsh</string>
         <string>-c</string>
-        <!-- 
-          FIX: This command is now simplified to *only* run the policy.
-          The script's own internal logic (remove_relaunch_agent)
-          already handles removing this daemon when the user
-          finally clicks "Migrate Now" or runs out of deferrals.
-          
+        <!--
+          This command runs the policy again.
           The 'KeepAlive = { SuccessfulExit = false }' key
           handles the deferral case:
           1. User defers.
@@ -172,9 +170,8 @@ schedule_relaunch() {
         <string>/usr/local/bin/jamf policy -id $JAMF_POLICY_ID</string>
     </array>
     
-    <!-- 
-      FIX: Replaced StartCalendarInterval with StartInterval.
-      This key runs the job N seconds from when it's loaded,
+    <!--
+      StartInterval runs the job N seconds from when it's loaded,
       and *will* run on wake if the interval was missed while asleep.
       Since the script re-runs and re-loads this daemon on every
       deferral, it effectively acts as a "run once in N seconds" timer.
@@ -187,12 +184,14 @@ schedule_relaunch() {
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    
+    <!--
+      ThrottleInterval controls the retry loop if the job exits non-zero.
+      This is now used by our "no user logged in" check.
+    -->
     <key>ThrottleInterval</key>
     <integer>600</integer>
     
-    <!-- 
-      FIX: Changed log paths to /var/log/ for a system daemon
-    -->
     <key>StandardOutPath</key>
     <string>/var/log/com.lbg.jamf-migration.out.log</string>
     <key>StandardErrorPath</key>
@@ -204,11 +203,9 @@ schedule_relaunch() {
 </plist>
 EOF
 
-    # --- FIX: Set correct ownership (root:wheel) for a Launch Daemon ---
     chown root:wheel "$LAUNCH_DAEMON_PATH"
     chmod 644 "$LAUNCH_DAEMON_PATH"
 
-    # --- FIX: Load the new daemon into the 'system' context ---
     if ! launchctl bootstrap "system" "$LAUNCH_DAEMON_PATH"; then
       err "schedule_relaunch" "Failed to bootstrap (load) the Launch Daemon!"
     else
@@ -217,37 +214,26 @@ EOF
     log "Launch Daemon loaded and scheduled to run policy $JAMF_POLICY_ID."
 }
 
-# ---
-# --- FIX: THIS ENTIRE FUNCTION HAS BEEN REPLACED ---
-# ---
 remove_relaunch_agent() {
-    # --- FIX: Use the Launch Daemon path ---
     if [ -f "$LAUNCH_DAEMON_PATH" ]; then
         log "Removing relaunch daemon."
-        # --- FIX: Bootout from 'system' context and use the daemon path ---
         launchctl bootout "system/$LAUNCH_DAEMON_PATH" &>/dev/null
         rm "$LAUNCH_DAEMON_PATH"
     fi
 }
 
-# ---
-# --- handle_deferral FUNCTION - NOW WITH JQ_BINARY FIX & NEXTRUNEPOCH---
-# ---
 handle_deferral() {
     deferral_count=$((deferral_count + 1))
     defaults write "$PLIST_PATH" DeferralCount -int "$deferral_count"
     log "User deferred. New count: $deferral_count."
 
     local future_hour future_minute friendly_time
-    # --- FIX: Add variables for epoch/seconds calculation ---
     local seconds_to_wait
     local now_epoch
     now_epoch=$(date +%s)
     
     local current_hour
     current_hour=$(date +%H)
-    
-    # --- THIS IS THE FIX ---
     
     # 1. Capture the JSON output from swiftDialog
     local defer_choice_json
@@ -258,32 +244,24 @@ handle_deferral() {
       --selectvalues "1h: Remind me in 1 Hour, 2h: Remind me in 2 Hours, 4h: Remind me in 4 Hours, 12pm: Defer until 12:00 PM, 5pm: Defer until 5:00 PM, 9am: Defer until 9:00 AM" \
       --selectdefault "1h" \
       --button1text "Confirm Deferral" \
-      --json) # <-- FIX: Added --json flag
+      --json)
     
-    # 2. Check for "Cancel" (non-zero exit code) - this must be done *before* parsing
+    # 2. Check for "Cancel" (non-zero exit code)
     [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
     
     # 3. Log the raw JSON output for debugging
     log "Raw JSON from dialog: $defer_choice_json"
     
     # 4. Parse the JSON to get the *actual* key (e.g., "1h")
-    #    USE THE $JQ_BINARY variable to ensure the command is found
-    #    FIX: Use correct jq query for nested JSON and split "4h:..." string
     local defer_choice
     defer_choice=$("$JQ_BINARY" -r '.["Deferral Options"].selectedValue | split(":")[0]' <<< "$defer_choice_json")
     
-    # 4. Added explicit logging so you can see the result in your log file
     log "Parsed defer_choice from swiftDialog JSON: '$defer_choice'"
     
-    # --- END OF FIX ---
-    
-    # This case statement will now receive the correct value ("1h", "2h", "12pm", etc.)
     case "$defer_choice" in
         "1h")
-            # --- FIX: Calculate seconds ---
             seconds_to_wait=3600
             
-            # (Friendly time logic remains for the dialog)
             if [[ "$(date -v+1H +%d)" == "$(date +%d)" ]]; then
                 friendly_time=$(date -v+1H +"today at %-I:%M %p")
             else
@@ -292,7 +270,6 @@ handle_deferral() {
             log "User chose to defer for 1 hour (3600s)."
             ;;
         "2h")
-            # --- FIX: Calculate seconds ---
             seconds_to_wait=7200
 
             if [[ "$(date -v+2H +%d)" == "$(date +%d)" ]]; then
@@ -303,7 +280,6 @@ handle_deferral() {
             log "User chose to defer for 2 hours (7200s)."
             ;;
         "4h")
-            # --- FIX: Calculate seconds ---
             seconds_to_wait=14400
 
             if [[ "$(date -v+4H +%d)" == "$(date +%d)" ]]; then
@@ -314,7 +290,6 @@ handle_deferral() {
             log "User chose to defer for 4 hours (14400s)."
             ;;
         "12pm")
-            # --- FIX: Calculate seconds until 12:00 PM ---
             local target_epoch
             target_epoch=$(date -j -v12H -v0M -v0S +%s) # 12:00:00 today
             if [[ "$now_epoch" -ge "$target_epoch" ]]; then
@@ -328,7 +303,6 @@ handle_deferral() {
             log "User chose to defer until 12 PM ($seconds_to_wait seconds)."
             ;;
         "5pm")
-            # --- FIX: Calculate seconds until 5:00 PM ---
             local target_epoch
             target_epoch=$(date -j -v17H -v0M -v0S +%s) # 5:00:00 PM today
             if [[ "$now_epoch" -ge "$target_epoch" ]]; then
@@ -342,7 +316,6 @@ handle_deferral() {
             log "User chose to defer until 5 PM ($seconds_to_wait seconds)."
             ;;
         "9am")
-            # --- FIX: Calculate seconds until 9:00 AM ---
             local target_epoch
             target_epoch=$(date -j -v9H -v0M -v0S +%s) # 9:00:00 AM today
             if [[ "$now_epoch" -ge "$target_epoch" ]]; then
@@ -356,9 +329,7 @@ handle_deferral() {
             log "User chose to defer until 9 AM ($seconds_to_wait seconds)."
             ;;
         *)
-            # This block will now only be hit if jq *really* fails for some reason
             log "Invalid deferral choice received: '$defer_choice'. Defaulting to 1 hour."
-            # --- FIX: Calculate seconds ---
             seconds_to_wait=3600
             
             if [[ "$(date -v+1H +%d)" == "$(date +%d)" ]]; then
@@ -369,19 +340,12 @@ handle_deferral() {
             ;;
     esac
 
-    #
-    # --- SOLUTION: Part 1 (Write the deferral time) ---
-    #
     # Calculate and store the *exact* future time.
     local next_run_epoch
     next_run_epoch=$((now_epoch + seconds_to_wait))
     defaults write "$PLIST_PATH" NextRunEpoch -int "$next_run_epoch"
     log "Storing next run epoch: $next_run_epoch (i.e., $(date -r $next_run_epoch))"
-    #
-    # --- END OF SOLUTION Part 1 ---
-    #
 
-    # --- FIX: Pass seconds to schedule_relaunch ---
     schedule_relaunch "$seconds_to_wait"
     
     show_dialog_info "Migration Deferred" "You will be reminded $friendly_time."
@@ -389,17 +353,12 @@ handle_deferral() {
     # We must also chown the plist, as this function may create it
     chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
     
-    # --- FIX for Issue #1 ---
-    # Added explicit log message to confirm the script is exiting as intended.
     log "Deferral scheduled successfully. The script will now exit."
     
     exit 0
 }
 
 check_deferral() {
-  #
-  # --- SOLUTION: Part 2 (Check the deferral time) ---
-  #
   # Check if a deferral is *already active*
   if [ -f "$PLIST_PATH" ]; then
     local next_run_epoch
@@ -416,9 +375,6 @@ check_deferral() {
       exit 0
     fi
   fi
-  #
-  # --- END OF SOLUTION Part 2 ---
-  #
   
   if [ ! -f "$PLIST_PATH" ]; then
     log "Plist not found. Creating with 0 deferrals."
@@ -428,7 +384,6 @@ check_deferral() {
     # Set ownership of the new directory to the user
     chown -R "$LOGGED_IN_USER" "$plist_dir"
     defaults write "$PLIST_PATH" DeferralCount -int 0
-    # --- SOLUTION: Initialize NextRunEpoch to 0 ---
     defaults write "$PLIST_PATH" NextRunEpoch -int 0
     # Set ownership of the new plist to the user
     chown "$LOGGED_IN_USER" "$PLIST_PATH"
@@ -441,14 +396,12 @@ check_deferral() {
   if [ "$remaining_deferrals" -le 0 ]; then
     show_dialog_info "Mandatory Migration" "The migration is now mandatory and the process will begin automatically."
     remove_relaunch_agent # Clean up scheduler as it's no longer needed
-    # --- SOLUTION: Reset NextRunEpoch after mandatory migration ---
     defaults write "$PLIST_PATH" NextRunEpoch -int 0
     chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
   else
     if show_dialog_confirm "StratMac to LBG Business Migration" "This Mac is now due to migrate over to the new LBG Business build for Apple Mac devices.\n\n The entire process will take roughly 1 hour depending on your internet speed.\n\n You have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
         log "User chose to migrate."
         remove_relaunch_agent # Clean up scheduler
-        # --- SOLUTION: Reset NextRunEpoch on migration ---
         defaults write "$PLIST_PATH" NextRunEpoch -int 0
         chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
     else
@@ -520,7 +473,6 @@ setup_environment() {
       err "setup_environment" "$error_msg"
     fi
     
-    # --- FIX: Check for required binaries ---
     if [[ ! -x "$DIALOG_BINARY" ]]; then
       err "setup_environment" "swiftDialog not found at $DIALOG_BINARY. Please install it."
     fi
@@ -677,8 +629,6 @@ get_jamf_auth_token() {
       -H "content-type: application/x-www-form-urlencoded" \
       -d "grant_type=client_credentials&client_id=$client_id&client_secret=$client_secret"
   )
-  bearer_token=$(echo "$response" | jq -r '.access_token')
-  # Use the JQ_BINARY variable here too, just in case
   bearer_token=$(echo "$response" | "$JQ_BINARY" -r '.access_token')
   
   [[ -z "$bearer_token" || "$bearer_token" == "null" ]] && err "get_jamf_auth_token" "Failed to get API token from Jamf Pro."
@@ -691,7 +641,6 @@ get_computer_inventory_id() {
     local filter_encoded
     filter_encoded=$(urlencode "$filter")
 
-    # --- FIX: Changed %%{http_code} to %{http_code} ---
     response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
         -H "Authorization: Bearer $bearer_token" \
         "$origin_jamf_url/api/v1/computers-inventory?section=GENERAL&filter=${filter_encoded}")
@@ -699,14 +648,11 @@ get_computer_inventory_id() {
     http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
     response_body=$(echo "$response" | sed '$d')
 
-    # --- FIX for Issue #2 ---
-    # The variable was $http_s, which was a typo. Corrected to $http_status.
     if [[ "$http_status" -ne 200 ]];
     then
         err "get_computer_inventory_id" "Jamf API request failed with HTTP status $http_status."
     fi
 
-    # Use JQ_BINARY here for robustness
     computer_id=$(echo "$response_body" | "$JQ_BINARY" -r '.results[0].id')
     management_id=$(echo "$response_body" | "$JQ_BINARY" -r '.results[0].general.managementId')
     
@@ -731,7 +677,6 @@ clear_failed_commands() {
   then
     success "Successfully cleared failed/pending commands (HTTP $http_status)."
   else
-    # This is not a critical failure, so just log a warning.
     log "WARN: Could not clear failed commands (HTTP $http_status). This is non-critical, proceeding anyway."
   fi
 }
@@ -747,7 +692,7 @@ trigger_remote_wipe() {
     fi
     
     show_dialog_info "Wipe Command Sent" "The remote wipe command has been sent to this Mac. It will restart and erase itself shortly."
-    # This payload is structured for the /v2/mdm/commands endpoint
+    
     local payload
     payload=$(printf '{
       "commandData": {
@@ -758,8 +703,6 @@ trigger_remote_wipe() {
       "clientData": [{"managementId": "%s"}]
     }' "$management_id")
 
-    # The correct endpoint for this command is /api/v2/mdm/commands
-    # --- FIX: Removed extra blank line after -X POST \ ---
     response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
      "$origin_jamf_url/api/v2/mdm/commands" \
         -H "Authorization: Bearer $bearer_token" \
@@ -770,8 +713,7 @@ trigger_remote_wipe() {
     
     if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]];
     then
-        success "EraseDevice command sent successfully (HTTP $http_stepstatus)."
-        # --- SOLUTION: Reset Deferral/Epoch counts on successful wipe command ---
+        success "EraseDevice command sent successfully (HTTP $http_status)."
         log "Resetting deferral counts after successful wipe command."
         defaults write "$PLIST_PATH" DeferralCount -int 0
         defaults write "$PLIST_PATH" NextRunEpoch -int 0
@@ -788,12 +730,13 @@ trigger_remote_wipe() {
 #
 
 main() {
+  # Note: The LOGGED_IN_USER check is now at the very top of the script.
+  
   # --- Initial Setup & Critical Checks ---
-  # setup_environment now checks for jq and dialog
   setup_environment
   check_hardware_support
   
-  # --- SOLUTION: This function now contains the guard logic ---
+  # This function now contains the guard logic for active deferrals
   check_deferral
 
   # --- User Dialogs ---
