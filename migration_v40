@@ -189,7 +189,7 @@ schedule_relaunch() {
     </dict>
     
     <key>ThrottleInterval</key>
-    <integer>600</integer>
+    <integer>300</integer>
     
     <key>StandardOutPath</key>
     <string>/var/log/com.lbg.jamf-migration.out.log</string>

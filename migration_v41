@@ -798,10 +798,6 @@ main() {
       if [ -n "$existing_pid" ] && kill -0 "$existing_pid" &>/dev/null; then
           log "WARN: Lock file found for running PID $existing_pid. Another instance is active."
           log "Activating existing dialog window and exiting."
-          
-          # This command tells swiftDialog to bring its windows to the front
-          "$DIALOG_BINARY" --activate
-          
           exit 0 # Exit 0 to satisfy the LaunchDaemon
       else
           log "WARN: Stale lock file found. Removing and proceeding."

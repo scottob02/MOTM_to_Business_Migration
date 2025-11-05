@@ -3,11 +3,12 @@
 #
 # ─── PRE-FLIGHT USER CHECK ───────────────────────────────────────────────────
 #
-# This script must run as root, but *interact* with the logged-in user.
+
+# This script must run as root, but interact with the logged-in user.
 # If no user is logged in (e.g., at the login window), we must exit non-zero.
-# Exiting non-zero (e.g., exit 1) tells the Launch Daemon to *retry*
+# Exiting non-zero (e.g., exit 1) tells the Launch Daemon to retry later
 # (based on ThrottleInterval) instead of succeeding and disabling itself.
-#
+
 LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
 if [ -z "$LOGGED_IN_USER" ]; then
     echo "[$(date)] [WARN] Migration script triggered, but no user is logged in. Exiting 1 to force retry." | tee -a "/var/log/com.lbg.jamf-migration.out.log"
@@ -20,9 +21,7 @@ fi
 
 # --- Deferral Settings ---
 MAX_DEFERRALS=5
-# LOGGED_IN_USER is now defined above
 PLIST_PATH="/Users/$LOGGED_IN_USER/Library/Application Support/LBG/com.lbg.jamf-migration.plist"
-# LAUNCH_DAEMON_PATH is no longer needed as we create unique ones.
 
 # --- SwiftDialog Settings ---
 DIALOG_BINARY="/usr/local/bin/dialog"
@@ -131,18 +130,13 @@ schedule_relaunch() {
     
     log "Scheduling relaunch for $seconds_to_wait seconds from now."
     
-    # --- NEW: Create a unique label and path for the new daemon ---
+    # Create a unique label and path for the new daemon ---
     local unique_id
     unique_id=$(date +%s)
     local new_label="com.lbg.jamf-migration.$unique_id"
     local new_daemon_path="/Library/LaunchDaemons/$new_label.plist"
     
     log "Creating new daemon: $new_label"
-    
-    # We no longer need to remove/bootout/remove the old daemon.
-    # The current script (run by the old daemon) will exit 0, 
-    # and its daemon will stop itself (due to KeepAlive=false).
-    # We just create and load the *new* one.
 
     cat << EOF > "$new_daemon_path"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -189,7 +183,7 @@ schedule_relaunch() {
       This is now used by our "no user logged in" check.
     -->
     <key>ThrottleInterval</key>
-    <integer>600</integer>
+    <integer>300</integer>
     
     <key>StandardOutPath</key>
     <string>/var/log/com.lbg.jamf-migration.out.log</string>
@@ -384,7 +378,7 @@ handle_deferral() {
 }
 
 check_deferral() {
-  # Check if a deferral is *already active*
+  # Check if a deferral is already active
   if [ -f "$PLIST_PATH" ]; then
     local next_run_epoch
     local now_epoch
@@ -473,7 +467,6 @@ Please double-check that OneDrive has finished syncing all your important files.
     success "User has explicitly confirmed data backup and accepts erasure."
 }
 
-
 #
 # ─── ENVIRONMENT & PREFLIGHT CHECKS ───────────────────────────────────────────
 #
@@ -483,27 +476,17 @@ setup_environment() {
     local missing_params=false
     local error_msg="Missing required parameters:"
 
-    if [ -z "$JAMF_CLIENT_ID" ];
-    then error_msg+="\n- JAMF_CLIENT_ID"; missing_params=true; fi
-    if [ -z "$JAMF_CLIENT_SECRET" ]; then error_msg+="\n- JAMF_CLIENT_SECRET"; missing_params=true;
-    fi
-    if [ -z "$ORIGIN_JAMF_URL" ]; then error_msg+="\n- ORIGIN_JAMF_URL"; missing_params=true;
-    fi
-    if [ -z "$TARGET_JAMF_URL" ]; then error_msg+="\n- TARGET_JAMF_URL"; missing_params=true;
-    fi
-    if [ -z "$JAMF_POLICY_ID" ]; then error_msg+="\n- JAMF_POLICY_ID (e.g., 123)"; missing_params=true;
-    fi
+    if [ -z "$JAMF_CLIENT_ID" ]; then error_msg+="\n- JAMF_CLIENT_ID"; missing_params=true; fi
+    if [ -z "$JAMF_CLIENT_SECRET" ]; then error_msg+="\n- JAMF_CLIENT_SECRET"; missing_params=true;fi
+    if [ -z "$ORIGIN_JAMF_URL" ]; then error_msg+="\n- ORIGIN_JAMF_URL"; missing_params=true;fi
+    if [ -z "$TARGET_JAMF_URL" ]; then error_msg+="\n- TARGET_JAMF_URL"; missing_params=true;fi
+    if [ -z "$JAMF_POLICY_ID" ]; then error_msg+="\n- JAMF_POLICY_ID (e.g., 123)"; missing_params=true;fi
 
-    if $missing_params; then
-      err "setup_environment" "$error_msg"
-    fi
+    if $missing_params; then err "setup_environment" "$error_msg"; fi
     
-    if [[ ! -x "$DIALOG_BINARY" ]]; then
-      err "setup_environment" "swiftDialog not found at $DIALOG_BINARY. Please install it."
-    fi
-    if [[ ! -x "$JQ_BINARY" ]]; then
-      err "setup_environment" "jq not found at $JQ_BINARY. Please install it."
-    fi
+    if [[ ! -x "$DIALOG_BINARY" ]]; then err "setup_environment" "swiftDialog not found at $DIALOG_BINARY. Please install it."; fi
+    if [[ ! -x "$JQ_BINARY" ]]; then err "setup_environment" "jq not found at $JQ_BINARY. Please install it."; fi
+    
     success "Required binaries (dialog, jq) found."
 
     client_id="$JAMF_CLIENT_ID"
@@ -545,8 +528,6 @@ check_os_version() {
 
 get_connection_type() {
   log "Determining active network service…"
-  
-  # Extract the hostname from the origin Jamf URL
   local jamf_host
   jamf_host=$(echo "$origin_jamf_url" | awk -F/ '{print $3}')
 
@@ -755,13 +736,9 @@ trigger_remote_wipe() {
 #
 
 main() {
-  # Note: The LOGGED_IN_USER check is now at the very top of the script.
-  
   # --- Initial Setup & Critical Checks ---
   setup_environment
   check_hardware_support
-  
-  # This function now contains the guard logic for active deferrals
   check_deferral
 
   # --- User Dialogs ---
@@ -776,8 +753,8 @@ main() {
   check_apns_connectivity
   check_jamf_enrollment
   check_mdm_profile
-  
   log "All pre-flight checks passed."
+
   # --- Get Jamf Info ---
   get_jamf_auth_token
   get_computer_inventory_id
