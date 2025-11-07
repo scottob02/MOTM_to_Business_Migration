@@ -1,5 +1,9 @@
 #!/bin/zsh
 
+# Script created by Scott O'Brien (Modern Workplace Platform) for Lloyds Banking Group
+# Purpose: Migrate Apple Macs from StratMac (MOTM) to LBG Business Jamf Pro instance
+# Date: 07/11/2025
+
 #
 # ─── PRE-FLIGHT USER CHECK ───────────────────────────────────────────────────
 #
