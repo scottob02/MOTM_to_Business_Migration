@@ -36,7 +36,7 @@ JAMF_CLIENT_SECRET="${5:-$JAMF_CLIENT_SECRET}"
 ORIGIN_JAMF_URL="${6:-$ORIGIN_JAMF_URL}"
 TARGET_JAMF_URL="${7:-$TARGET_JAMF_URL}"
 DRY_RUN="${8:-${DRY_RUN:-false}}"
-JAMF_POLICY_ID="${9:-$JAMF_POLICY_ID}" # Used by the scheduler to re-run this script
+JAMF_POLICY_ID="${9:-$JAMF_POLICY_ID}"
 
 # --- Process Lock File ---
 # This file prevents multiple instances of the script from running and
@@ -51,16 +51,10 @@ computer_id=""
 # ─── LOGGING AND UTILITIES ────────────────────────────────────────────────────
 #
 
-# LOG_FILE must be defined *after* LOGGED_IN_USER
 LOG_FILE="/Users/$LOGGED_IN_USER/jamf_migration_preflight.log"
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m' # No Color (Reset)
 
 remove_lockfile() {
-    # This trap ensures the lock file is removed when the script exits,
-    # preventing orphaned locks.
+    # This trap ensures the lock file is removed when the script exits, preventing orphaned locks.
     if [ -f "$LOCK_FILE" ]; then
         local pid_in_file
         pid_in_file=$(cat "$LOCK_FILE" 2>/dev/null)
@@ -78,7 +72,7 @@ trap remove_lockfile EXIT
 # Formats and prints a standard log message.
 log() {
   printf '%b[%s] [INFO]  %s%b\n' \
-    "$YELLOW" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" |
+    "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" |
     tee -a "$LOG_FILE"
 }
 
@@ -86,7 +80,7 @@ log() {
 # Formats and prints a success log message.
 success() {
   printf '%b[%s] [SUCCESS] %s%b\n' \
-    "$GREEN" "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" |
+    "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" |
     tee -a "$LOG_FILE"
 }
 
@@ -96,7 +90,7 @@ err() {
   local caller="$1"
   local message="$2"
   printf '%b[%s] [ERROR] [%s] %s%b\n' \
-    "$RED" "$(date '+%Y-%m-%dT%H:%M:%S')" "$caller" "$message" "$NC" |
+    "$(date '+%Y-%m-%dT%H:%M:%S')" "$caller" "$message" "$NC" |
     tee -a "$LOG_FILE" >&2
   show_dialog_error "[$caller] $message"
   exit 1 # Exit 1 will also trigger the EXIT trap
@@ -166,11 +160,9 @@ show_dialog_confirm() {
 #
 
 ## schedule_relaunch
-# Creates and loads a new, unique LaunchDaemon to re-run the migration
-# policy after a specified delay.
+# Creates and loads a new, unique LaunchDaemon to re-run the migration policy after a specified delay.
 schedule_relaunch() {
     local seconds_to_wait=$1
-    
     log "Scheduling relaunch for $seconds_to_wait seconds from now."
 
     # Create a unique label and path for the new daemon to avoid conflicts.
@@ -178,14 +170,11 @@ schedule_relaunch() {
     unique_id=$(date +%s)
     local new_label="com.lbg.jamf-migration.$unique_id"
     local new_daemon_path="/Library/LaunchDaemons/$new_label.plist"
-    
     log "Creating new daemon: $new_label"
     
     # This script (run by the *old* daemon) will exit 0.
-    # The old daemon's 'KeepAlive = { SuccessfulExit = false }' key
-    # will cause it to stop and unload itself.
+    # The old daemon's 'KeepAlive = { SuccessfulExit = false }' key will cause it to stop and unload itself.
     # We only need to create and load the *new* one.
-
     cat << EOF > "$new_daemon_path"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -210,7 +199,7 @@ schedule_relaunch() {
     </dict>
     
     <key>ThrottleInterval</key>
-    <integer>600</integer>
+    <integer>300</integer>
     
     <key>StandardOutPath</key>
     <string>/var/log/com.lbg.jamf-migration.out.log</string>
@@ -247,7 +236,6 @@ handle_deferral() {
     local seconds_to_wait
     local now_epoch
     now_epoch=$(date +%s)
-    
     local current_hour
     current_hour=$(date +%H)
     
@@ -265,14 +253,10 @@ handle_deferral() {
     # Check for "Cancel" (non-zero exit code)
     [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
     
-    log "Raw JSON from dialog: $defer_choice_json"
-    
-    # Parse the JSON to get the *actual* key (e.g., "1h")
+    # Parse the JSON to get the deferal key (e.g., "1h")
     local defer_choice
     defer_choice=$(jq -r '.["Deferral Options"].selectedValue | split(":")[0]' <<< "$defer_choice_json")
-    
     log "Parsed defer_choice from swiftDialog JSON: '$defer_choice'"
-    
     case "$defer_choice" in
         "1h")
             seconds_to_wait=3600
@@ -316,7 +300,7 @@ handle_deferral() {
             ;;
         "5pm")
             local target_epoch
-            target_epoch=$(date -j -v17H -v0M -v0S +%s) # 5:00:00 PM today
+            target_epoch=$(date -j -v17H -v0M -v0S +%s) # 17:00:00 today
             if [[ "$now_epoch" -ge "$target_epoch" ]]; then
                 # 5pm has passed today, schedule for 5pm tomorrow
                 target_epoch=$(date -j -v+1d -v17H -v0M -v0S +%s)
@@ -329,7 +313,7 @@ handle_deferral() {
             ;;
         "9am")
             local target_epoch
-            target_epoch=$(date -j -v9H -v0M -v0S +%s) # 9:00:00 AM today
+            target_epoch=$(date -j -v9H -v0M -v0S +%s) # 09:00:00  today
             if [[ "$now_epoch" -ge "$target_epoch" ]]; then
                 # 9am has passed today, schedule for 9am tomorrow
                 target_epoch=$(date -j -v+1d -v9H -v0M -v0S +%s)
@@ -351,17 +335,16 @@ handle_deferral() {
             ;;
     esac
 
-    # Calculate and store the *exact* future time.
+    # Calculate and store the future time.
     local next_run_epoch
     next_run_epoch=$((now_epoch + seconds_to_wait))
     defaults write "$PLIST_PATH" NextRunEpoch -int "$next_run_epoch"
     log "Storing next run epoch: $next_run_epoch (i.e., $(date -r $next_run_epoch))"
-
     schedule_relaunch "$seconds_to_wait"
     
     show_dialog_info "Migration Deferred" "You will be reminded $friendly_time."
     
-    # We must chown the plist, as this function may create it as root.
+    # chown the plist, as this function may create it as root.
     chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
     
     log "Deferral scheduled successfully. The script will now exit 0."
@@ -376,7 +359,7 @@ handle_deferral() {
 # 3. Checks if deferrals have run out. If so, forces migration.
 # 4. If deferrals remain, prompts user to migrate or defer.
 check_deferral() {
-  # Check if a deferral is *already active*
+  # Check if a deferral is already active
   if [ -f "$PLIST_PATH" ];
   then
     local next_run_epoch
@@ -387,8 +370,7 @@ check_deferral() {
     
     if [[ "$next_run_epoch" -gt "$now_epoch" ]];
     then
-      # A deferral is active and the time has not yet passed.
-      # This script was likely re-triggered by Jamf. Exit silently.
+      # A deferral is active and the time has not yet passed, script was likely re-triggered in error. Exit silently.
       local remaining_seconds=$((next_run_epoch - now_epoch))
       log "Deferral is still active. Next run scheduled for $(date -r $next_run_epoch) ($remaining_seconds seconds from now). Script will exit."
       exit 0
@@ -416,16 +398,14 @@ check_deferral() {
   log "Deferral count: $deferral_count. Remaining: $remaining_deferrals."
   
   if [ "$remaining_deferrals" -le 0 ]; then
-    # Force migration
-    show_dialog_info "Mandatory Migration" "The migration is now mandatory and the process will begin automatically."
-    # No need to remove daemons; wipe will handle it.
+    # Max deferrals reached, force migration
+    show_dialog_info "Migration Required - Max Deferrals Reached" "The migration is now mandatory and can no longer be deferred."
     defaults write "$PLIST_PATH" NextRunEpoch -int 0
     chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
   else
-    # Prompt user
-    if show_dialog_confirm "StratMac to LBG Business Migration" "This Mac is now due to migrate over to the new LBG Business build for Apple Mac devices.\n\n The entire process will take roughly 1 hour depending on your internet speed.\n\n You have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
+    # Prompt user with option to migrate now or defer
+    if show_dialog_confirm "StratMac to LBG Business Migration" "This Mac is now due to migrate over to the new LBG Business build for Apple Mac devices.\n\n The entire process will take roughly 45 minutes depending on your internet speed.\n\n You have $remaining_deferrals deferrals remaining." "Migrate Now" "Defer"; then
         log "User chose to migrate."
-        # No need to remove daemons; wipe will handle it.
         defaults write "$PLIST_PATH" NextRunEpoch -int 0
         chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
     else
@@ -440,10 +420,10 @@ check_deferral() {
 show_requirements_dialog() {
     local message
     message="To ensure a smooth migration to LBG Business, please verify the following requirements before you continue:\n\n"
-    message+="* **Power:** Your Mac must be connected to a power source.\n"
+    message+="* **Power:** Your Mac must be connected to a power source with the lid open.\n"
     message+="* **Internet:** A stable internet connection throughout the entire migration is required.\n"
-    message+="* **Data Backed-up:** Any information, files, or notes you wish to keep must be saved and uploaded to OneDrive. Anything not stored in OneDrive will be permanetly deleted. \n\n"
-    message+="Additionally this process will close all open applications and then perform a factory reset which will wipe all data from this Mac."
+    message+="* **Data Backed-up:** Any information, files, or notes you wish to keep must be saved and uploaded to OneDrive. Anything not stored in OneDrive will be permanetly deleted (and cannot be recovered). \n\n"
+    message+="Additionally this process will close all open applications and then perform a factory reset which will wipe all data from your Mac."
 
     if ! show_dialog_confirm "Migration Requirements" "$message" "I Understand, Continue" "Cancel";
     then
@@ -458,24 +438,24 @@ show_data_backup_dialog() {
     local message
     message="**FINAL DATA WARNING**
 
-This is your final confirmation that **all data on this Mac will be permanently erased.**
+This is your final confirmation that **all data on your Mac will be permanently erased.**
 
 - This action **cannot be undone**.
 - Only files you have saved and **fully synced to OneDrive** will be available after the migration.
 
 Please double-check that OneDrive has finished syncing all your important files."
 
-    if ! "$DIALOG_BINARY" --title "Have You Synced All Your Data?" \
+    if ! "$DIALOG_BINARY" --title "Have you synced all your data?" \
         --message "$message" \
         --icon "SF=exclamationmark.triangle.fill,colour=red" \
-        --button1text "I confirm I have synced everything I need" \
+        --button1text "I confirm I am ready to migrate this Mac" \
         --button2text "Cancel" \
         --width 650 --height 350 --messagefont "size=14";
     then
         log "User cancelled at the final data backup warning screen."
         exit 0
     fi
-    success "User has explicitly confirmed data backup and accepts erasure."
+    success "User has explicitly confirmed data backup and accepts migration."
 }
 
 
@@ -607,6 +587,18 @@ check_jamf_enrollment() {
   fi
 }
 
+## check_apns_connectivity
+# Verifies connectivity to APNs, which is required to receive the wipe command.
+check_apns_connectivity() {
+  log "Checking connectivity to Apple Push Notification Service (APNs)..."
+  if nc -z -G 3 api.push.apple.com 443;
+  then
+    success "APNs hostname (api.push.apple.com) is reachable on port 443."
+  else
+      err "check_apns_connectivity" "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail."
+  fi
+}
+
 ## kill_user_apps
 # Gracefully (then forcefully) quits all user-facing applications.
 kill_user_apps() {
@@ -645,18 +637,6 @@ kill_user_apps() {
       run_cmd kill -9 "$pid"
     fi
   done
-}
-
-## check_apns_connectivity
-# Verifies connectivity to APNs, which is required to receive the wipe command.
-check_apns_connectivity() {
-  log "Checking connectivity to Apple Push Notification Service (APNs)..."
-  if nc -z -G 3 api.push.apple.com 443;
-  then
-    success "APNs hostname (api.push.apple.com) is reachable on port 443."
-  else
-      err "check_apns_connectivity" "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail."
-  fi
 }
 
 
@@ -713,7 +693,7 @@ get_computer_inventory_id() {
 clear_failed_commands() {
   log "Clearing any existing failed or pending commands in Jamf Pro..."
   local payload='{"statuses": ["FAILED", "PENDING"]}'
-  
+
   response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
     "$origin_jamf_url/api/v1/computers-inventory/$computer_id/commands/flush" \
     -H "Authorization: Bearer $bearer_token" \
@@ -734,19 +714,9 @@ clear_failed_commands() {
 ## trigger_remote_wipe
 # Sends the 'EraseDevice' MDM command via the Jamf Pro API.
 trigger_remote_wipe() {
-    log "Initiating remote wipe via Jamf Pro API v2..."
-    
-    if $dry_run;
-    then
-        log "[DRY-RUN] Would have sent EraseDevice command for management ID $management_id."
-        success "[DRY-RUN] Remote wipe would have been initiated."
-        return
-    fi
-    
-    # Inform the user *before* sending the command.
-    show_dialog_info "Wipe Command Sent" "The remote wipe command has been sent to this Mac. It will restart and erase itself shortly."
-    
+    log "Initiating remote wipe via Jamf Pro API v2..."   
     local payload
+    
     payload=$(printf '{
       "commandData": {
         "commandType": "ERASE_DEVICE",
@@ -768,10 +738,10 @@ trigger_remote_wipe() {
     then
         success "EraseDevice command sent successfully (HTTP $http_status)."
         log "Resetting deferral counts after successful wipe command."
-        # Reset deferral info so the user gets a fresh start if they re-enroll.
         defaults write "$PLIST_PATH" DeferralCount -int 0
         defaults write "$PLIST_PATH" NextRunEpoch -int 0
         chown "$LOGGED_IN_USER" "$PLIST_PATH" 2>/dev/null
+        show_dialog_info "Wipe Command Sent" "The remote wipe command has been sent to this Mac. It will restart and erase itself shortly."
         exit 0
     else
         err "trigger_remote_wipe" "Failed to send EraseDevice command. HTTP status: $http_status"
@@ -784,27 +754,30 @@ trigger_remote_wipe() {
 #
 
 main() {
-  # Note: The LOGGED_IN_USER check is at the very top of the script.
-  
   # --- Initial Setup & Lock File Check ---
   setup_environment
-  
   log "Script started. Checking for existing instance..."
   if [ -f "$LOCK_FILE" ]; then
       local existing_pid
       existing_pid=$(cat "$LOCK_FILE" 2>/dev/null)
-      
       # Check if the PID in the lock file is a valid number and is still running
       if [ -n "$existing_pid" ] && kill -0 "$existing_pid" &>/dev/null; then
           log "WARN: Lock file found for running PID $existing_pid. Another instance is active."
           log "Activating existing dialog window and exiting."
+          currentUserUID=$(stat -f %u /dev/console)
+          # Check if we got a valid user (not 0, which is root)
+          if [ -n "$currentUserUID" ] && [ "$currentUserUID" -ne 0 ]; then
+              log "Found logged-in user UID: $currentUserUID. Attempting to activate PID: $existing_pid"
+              launchctl asuser "$currentUserUID" osascript -e "tell application \"System Events\" to tell (process id $existing_pid) to set frontmost to true"
+          else
+              log "WARN: Could not determine active user. Unable to bring dialog to front."
+          fi
           exit 0 # Exit 0 to satisfy the LaunchDaemon
       else
           log "WARN: Stale lock file found. Removing and proceeding."
           rm "$LOCK_FILE"
       fi
   fi
-  
   # Create the new lock file with our PID
   echo "$$" > "$LOCK_FILE"
   log "Lock file created for PID $$."
@@ -829,7 +802,6 @@ main() {
   check_apns_connectivity
   check_jamf_enrollment
   check_mdm_profile
-  
   log "All pre-flight checks passed."
   
   # --- Get Jamf Info ---
@@ -837,24 +809,7 @@ main() {
   get_computer_inventory_id
   clear_failed_commands
 
-  # --- Final Warning & App Kill ---
-  if ! "$DIALOG_BINARY" --title "⚠️ POINT OF NO RETURN" \
-    --message "This is your final confirmation.
-
-Clicking the button below will immediately:
-1. Close all running applications.
-2. Send the command to **permanently erase all data** from this Mac.
-
-This action cannot be undone." \
-    --icon "SF=exclamationmark.triangle.fill,colour=orange" \
-    --button1text "I understand, Migrate to LBG Business" \
-    --button2text "Cancel" \
-    --width 600 --height 350 --messagefont "size=14";
-  then
-    log "User cancelled at final warning."
-    exit 0 # Will trigger the EXIT trap to remove the lockfile
-  fi
-  
+  # --- Close User Apps ---
   kill_user_apps
 
   # --- Execute Wipe ---
