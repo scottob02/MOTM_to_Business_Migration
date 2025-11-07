@@ -826,5 +826,4 @@ main() {
   fi
 }
 
-# Pass all script parameters to the main function
 main "$@"
