@@ -748,7 +748,7 @@ trigger_remote_wipe() {
         show_dialog_info "Wipe Command Sent" "The remote wipe command has been sent to this Mac. It will restart and erase itself shortly."
         exit 0
     else
-        err "trigger_remote_wipe" "Failed to send EraseDevice command. HTTP status: $http_status"
+        err "trigger_remote_wipe" "Failed to send EraseDevice command. HTTP status: $http_status /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
     fi
 }
 
