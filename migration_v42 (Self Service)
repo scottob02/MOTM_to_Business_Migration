@@ -1,0 +1,552 @@
+#!/bin/zsh
+
+# Script created by Scott O'Brien (Modern Workplace Platform) for Lloyds Banking Group
+# Purpose: Migrate Apple Macs from StratMac (MOTM) to LBG Business Jamf Pro instance
+# This version is modified for Self Service to bypass all deferral logic.
+# Date: 07/11/2025
+
+# *PRE-FLIGHT USER CHECK*
+
+# This script must run as root (via the LaunchDaemon) but interact with the
+# currently logged-in user.
+# If no user is logged in (e.g., at the login window), we must exit with a
+# non-zero status.
+# This tells the LaunchDaemon to retry later (based on its
+# ThrottleInterval) instead of succeeding and disabling itself.
+
+LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
+if [ -z "$LOGGED_IN_USER" ];
+then
+    # Log to the system-level daemon log, as the user's log file may not be available.
+    echo "[$(date)] [WARN] Migration script triggered, but no user is logged in. Exiting 1 to force retry." |
+    tee -a "/var/log/com.lbg.jamf-migration.out.log"
+    exit 1
+fi
+
+# *SCRIPT CONFIGURATION*
+
+# SwiftDialog Settings 
+DIALOG_BINARY="/usr/local/bin/dialog"
+BRANDING_ICON="/Users/Shared/LBG_Branding_Cancara/lbg_primary_logo.png"
+
+# Jamf API Credentials & Endpoints (Passed as script parameters) 
+JAMF_CLIENT_ID="${4:-$JAMF_CLIENT_ID}"
+JAMF_CLIENT_SECRET="${5:-$JAMF_CLIENT_SECRET}"
+ORIGIN_JAMF_URL="${6:-$ORIGIN_JAMF_URL}"
+TARGET_JAMF_URL="${7:-$TARGET_JAMF_URL}"
+DRY_RUN="${8:-${DRY_RUN:-false}}"
+JAMF_POLICY_ID="${9:-$JAMF_POLICY_ID}" # Still used by err() messages
+
+# Process Lock File 
+# This file prevents multiple instances of the script from running and showing multiple dialogs to the user.
+LOCK_FILE="/var/tmp/com.lbg.jamf-migration.lock"
+
+# Global Variables 
+management_id=""
+computer_id=""
+
+# *LOGGING AND UTILITIES*
+
+LOG_FILE="/Users/$LOGGED_IN_USER/jamf_migration_preflight.log"
+
+remove_lockfile() {
+    # This trap ensures the lock file is removed when the script exits, preventing orphaned locks.
+    if [ -f "$LOCK_FILE" ]; then
+        local pid_in_file
+        pid_in_file=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [[ "$pid_in_file" == "$$" ]];
+        then
+            # Only remove the lock if it's ours
+            log "Script exiting, removing lock file for PID $$."
+            rm "$LOCK_FILE"
+        fi
+    fi
+}
+# Set the trap to run on any script exit (normal, error, or signal)
+trap remove_lockfile EXIT
+
+## log
+# Formats and prints a standard log message.
+log() {
+  printf '%b[%s] [INFO]  %s%b\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" |
+    tee -a "$LOG_FILE"
+}
+
+## success
+# Formats and prints a success log message.
+success() {
+  printf '%b[%s] [SUCCESS] %s%b\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$NC" |
+    tee -a "$LOG_FILE"
+}
+
+## err
+# Formats and prints an error message, shows an error dialog, and exits.
+err() {
+  local caller="$1"
+  local message="$2"
+  printf '%b[%s] [ERROR] [%s] %s%b\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S')" "$caller" "$message" "$NC" |
+    tee -a "$LOG_FILE" >&2
+  show_dialog_error "[$caller] $message"
+  exit 1 # Exit 1 will also trigger the EXIT trap
+}
+
+## run_cmd
+# Wrapper to execute commands, respecting dry_run mode
+run_cmd() {
+  if $dry_run && [[ "$1" == "kill" ]];
+  then
+    log "[DRY-RUN] Would execute: $*"
+  else
+    "$@"
+  fi
+}
+
+## urlencode
+# POSIX-compliant URL encoder.
+urlencode() {
+    local string="${1}"
+    local strlen=${#string}
+    local encoded=""
+    local pos c o
+    for (( pos=0 ; pos<strlen ; pos++ ));
+    do
+        c=${string:$pos:1}
+        case "$c" in
+            [-_.~a-zA-Z0-9] ) o="${c}" ;;
+            * )               printf -v o '%%%02x' "'$c"
+        esac
+        encoded+="${o}"
+    done
+    echo "${encoded}"
+}
+
+# *SWIFTDIALOG FUNCTIONS*
+
+## show_dialog_error
+# Displays a standardized error dialog.
+show_dialog_error() {
+  "$DIALOG_BINARY" --title "Migration Error" --message "$1" --icon "SF=xmark.octagon.fill,colour=red" \
+    --button1text "Close" --width 450 --height 250 --messagefont "size=12"
+}
+
+## show_dialog_info
+# Displays a standardized informational dialog.
+show_dialog_info() {
+    "$DIALOG_BINARY" --title "$1" --message "$2" --icon "$BRANDING_ICON" \
+      --button1text "OK" --width 450 --height 250 --messagefont "size=12"
+}
+
+## show_dialog_confirm
+# Displays a confirmation dialog with two buttons.
+# Returns 0 (success) if Button 1 is clicked, 1 (failure) if Button 2 is clicked.
+show_dialog_confirm() {
+   "$DIALOG_BINARY" --title "$1" --message "$2" --icon "$BRANDING_ICON" \
+      --button1text "${3:-Proceed}" --button2text "${4:-Cancel}" --width 550 --height 350 --messagefont "size=12"
+    return $?
+}
+
+## show_requirements_dialog
+# Displays the pre-migration requirements to the user.
+show_requirements_dialog() {
+    local message
+    message="To ensure a smooth migration to LBG Business, please verify the following requirements before you continue:\n\n"
+    message+="* **Power:** Your Mac must be connected to a power source with the lid open.\n"
+    message+="* **Internet:** A stable internet connection throughout the entire migration is required.\n"
+    message+="* **Data Backed-up:** Any information, files, or notes you wish to keep must be saved and uploaded to OneDrive. Anything not stored in OneDrive will be permanetly deleted (and cannot be recovered). \n\n"
+    message+="Additionally this process will close all open applications and then perform a factory reset which will wipe all data from your Mac."
+    if ! show_dialog_confirm "Migration Requirements" "$message" "I Understand, Continue" "Cancel";
+    then
+        log "User cancelled at the requirements screen."
+        exit 0
+    fi
+}
+
+## show_data_backup_dialog
+# Displays the final, critical warning about data erasure.
+show_data_backup_dialog() {
+    local message
+    message="**FINAL DATA WARNING**
+
+This is your final confirmation that **all data on your Mac will be permanently erased.**
+
+- This action **cannot be undone**.
+- Only files you have saved and **fully synced to OneDrive** will be available after the migration.
+
+Please double-check that OneDrive has finished syncing all your important files."
+    if ! "$DIALOG_BINARY" --title "Have you synced all your data?" \
+        --message "$message" \
+        --icon "SF=exclamationmark.triangle.fill,colour=red" \
+        --button1text "I confirm I am ready to migrate this Mac" \
+        --button2text "Cancel" \
+        --width 650 --height 350 --messagefont "size=14";
+    then
+        log "User cancelled at the final data backup warning screen."
+        exit 0
+    fi
+    success "User has explicitly confirmed data backup and accepts migration."
+}
+
+# *ENVIRONMENT & PREFLIGHT CHECKS*
+
+## setup_environment
+# Validates all required script parameters and binary dependencies.
+setup_environment() {
+    # Validate required parameters
+    local missing_params=false
+    local error_msg="Missing required parameters:"
+
+    if [ -z "$JAMF_CLIENT_ID" ];
+    then error_msg+="\n- JAMF_CLIENT_ID"; missing_params=true; fi
+    if [ -z "$JAMF_CLIENT_SECRET" ]; then error_msg+="\n- JAMF_CLIENT_SECRET"; missing_params=true;
+    fi
+    if [ -z "$ORIGIN_JAMF_URL" ]; then error_msg+="\n- ORIGIN_JAMF_URL"; missing_params=true;
+    fi
+    if [ -z "$TARGET_JAMF_URL" ]; then error_msg+="\n- TARGET_JAMF_URL"; missing_params=true;
+    fi
+    if [ -z "$JAMF_POLICY_ID" ]; then error_msg+="\n- JAMF_POLICY_ID (e.g., 123)"; missing_params=true;
+    fi
+
+    if $missing_params; then
+      err "setup_environment" "$error_msg"
+    fi
+    
+    # Validate required binaries
+    if [[ ! -x "$DIALOG_BINARY" ]]; then
+      err "setup_environment" "swiftDialog not found at $DIALOG_BINARY. Please install it. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+    fi
+    success "Required binaries (dialog) found."
+
+    # Normalize script parameters
+    client_id="$JAMF_CLIENT_ID"
+    client_secret="$JAMF_CLIENT_SECRET"
+    origin_jamf_url="${ORIGIN_JAMF_URL%/}"
+    target_jamf_url="${TARGET_JAMF_URL%/}"
+    dry_run=$(echo "$DRY_RUN" | tr '[:upper:]' '[:lower:]')
+    [[ "$dry_run" == "true" ]] && dry_run=true || dry_run=false
+
+    # Setup logging
+    log_dir=$(dirname "$LOG_FILE")
+    mkdir -p "$log_dir" 2>/dev/null
+    touch "$LOG_FILE" 2>/dev/null
+    
+    serial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
+    [ -z "$serial" ] && err "setup_environment" "Could not determine serial number."
+}
+
+## check_hardware_support
+# Ensures the device is an Apple Silicon Mac.
+check_hardware_support() {
+    log "Checking hardware for Apple Silicon..."
+    if ! sysctl -n machdep.cpu.brand_string | grep -q "Apple"; then
+        err "check_hardware_support" "This device is not an Apple Silicon Mac and is no longer supported. Please follow the process to order a new device."
+    fi
+    success "Apple Silicon Mac detected. Device is supported."
+}
+
+## check_os_version
+# Ensures the device is on macOS 12+ to support local erase.
+check_os_version() {
+    log "Checking macOS version for local erase eligibility..."
+    OS_VERSION=$(sw_vers -productVersion)
+    local os_major_version
+    os_major_version=$(echo "$OS_VERSION" | awk -F. '{print $1}')
+
+    if [[ "$os_major_version" -lt 12 ]];
+    then
+        err "check_os_version" "macOS version ($OS_VERSION) is older than macOS 12. Local 'Erase All Content and Settings' is not supported. /n/n Please submit a Mac Fault via IT@LBG for assistance."
+    else
+        success "macOS version ($OS_VERSION) supports local erase."
+    fi
+}
+
+## check_jamf_connectivity
+# Checks for basic network connectivity to the origin Jamf Pro server.
+check_jamf_connectivity() {
+  log "Determining active network service…"
+  local jamf_host
+  jamf_host=$(echo "$origin_jamf_url" | awk -F/ '{print $3}')
+
+  if ! curl -s --head --connect-timeout 5 "$origin_jamf_url" >/dev/null 2>&1; then
+      err "check_jamf_connectivity" "No connectivity to your Jamf server ($jamf_host). Migration requires an active internet connection. Please ensure you have an active and stable internet conenction /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+  else
+    success "Jamf connectivity check passed. ($jamf_host is reachable)"
+  fi
+}
+
+## check_device_power_type
+# Ensures the device is connected to AC power.
+check_device_power_type() {
+  log "Checking power source..."
+  if ! pmset -g batt | grep -q "AC Power";
+  then
+      err "check_device_power_type" "Device is not connected to AC power. Please connect your power adapter to continue. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+  else
+    success "Device is connected to AC power."
+  fi
+}
+
+## check_mdm_profile
+# Ensures the device is DEP-enrolled.
+check_mdm_profile() {
+  log "Checking for active MDM profile..."
+  if ! profiles status -type enrollment | grep -q "Enrolled via DEP:"; then
+      err "check_mdm_profile" "No active MDM profile was detected. This device must be enrolled in MDM to proceed. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+  else
+    success "Active MDM profile detected."
+  fi
+}
+
+## check_jamf_enrollment
+# Verifies the device is enrolled in the *origin* Jamf Pro instance.
+check_jamf_enrollment() {
+  log "Verifying current Jamf Pro enrollment status..."
+  if [[ ! -f "/usr/local/jamf/bin/jamf" ]];
+  then
+      err "check_jamf_enrollment" "Jamf binary not found - device not enrolled in any Jamf Pro instance. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+  else
+    local current_jss_url
+    current_jss_url=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)
+    
+    if [[ "$current_jss_url" == "$target_jamf_url"* ]];
+    then
+      err "check_jamf_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+    elif [[ "$current_jss_url" != "$origin_jamf_url"* ]]; then
+      log "WARN: Device is enrolled in neither the origin nor target Jamf instance. Current: $current_jss_url"
+    else
+      success "Confirmed device is enrolled in origin Jamf instance."
+    fi
+  fi
+}
+
+## check_apns_connectivity
+# Verifies connectivity to APNs, which is required to receive the wipe command.
+check_apns_connectivity() {
+  log "Checking connectivity to Apple Push Notification Service (APNs)..."
+  if nc -z -G 3 api.push.apple.com 443;
+  then
+    success "APNs hostname (api.push.apple.com) is reachable on port 443."
+  else
+      err "check_apns_connectivity" "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+  fi
+}
+
+## kill_user_apps
+# Gracefully (then forcefully) quits all user-facing applications.
+kill_user_apps() {
+  local excluded_patterns=("Self Service" "Terminal" "Finder" "dialog" "jamf" "Jamf" "Symantec" "WSS")
+  log "Starting graceful application termination..."
+  local app_pids=()
+  # Find processes running from the /Applications directory
+  ps -ax -o pid,command | grep "/Applications/.*\.app/" | grep -v grep | while read -r pid command;
+  do
+    local app_name
+    app_name=$(echo "$command" | sed -E 's|.*/Applications/([^/]+)\.app/.*|\1|')
+    local excluded=false
+    for pattern in "${excluded_patterns[@]}";
+    do
+      if [[ "$app_name" == *"$pattern"* ]];
+      then
+        excluded=true
+        break
+      fi
+    done
+    
+    if ! $excluded; then
+      log "Gracefully terminating $app_name (PID: $pid)"
+      run_cmd osascript -e "tell application \"$app_name\" to quit" &>/dev/null &
+      app_pids+=("$pid")
+    fi
+  done
+  
+  # Wait for graceful quit, then force-kill any remaining processes
+  sleep 3
+  for pid in "${app_pids[@]}";
+  do
+    if kill -0 "$pid" &>/dev/null; then
+      log "Force killing PID: $pid"
+      run_cmd kill -9 "$pid"
+    fi
+  done
+}
+
+# *JAMF PRO API FUNCTIONS*
+
+## get_jamf_auth_token
+# Obtains a Bearer Token from the origin Jamf Pro API.
+get_jamf_auth_token() {
+  log "Getting API token from origin Jamf..."
+  response=$(
+    curl -s -X POST "$origin_jamf_url/api/v1/oauth/token" \
+      -H "accept: application/json" \
+      -H "content-type: application/x-www-form-urlencoded" \
+      -d "grant_type=client_credentials&client_id=$client_id&client_secret=$client_secret"
+  )
+  bearer_token=$(echo "$response" | jq -r '.access_token')
+  
+  [[ -z "$bearer_token" || "$bearer_token" == "null" ]] && err "get_jamf_auth_token" "Failed to get API token from Jamf Pro."
+  success "API token obtained successfully."
+}
+
+## get_computer_inventory_id
+# Finds the device's Jamf computer ID and Management ID using its serial number.
+get_computer_inventory_id() {
+    log "Looking up device by serial: '$serial'"
+    local filter="hardware.serialNumber==\"$serial\""
+    local filter_encoded
+    filter_encoded=$(urlencode "$filter")
+
+    response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+        -H "Authorization: Bearer $bearer_token" \
+        "$origin_jamf_url/api/v1/computers-inventory?section=GENERAL&filter=${filter_encoded}")
+    
+    http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
+    response_body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_status" -ne 200 ]];
+    then
+        err "get_computer_inventory_id" "Jamf API request failed with HTTP status $http_status. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+    fi
+
+    computer_id=$(echo "$response_body" | jq -r '.results[0].id')
+    management_id=$(echo "$response_body" | jq -r '.results[0].general.managementId')
+    
+    [[ -z "$computer_id" || "$computer_id" == "null" ]] && err "get_computer_inventory_id" "Computer ID not found in Jamf Pro API response."
+    [[ -z "$management_id" || "$management_id" == "null" ]] && err "get_computer_inventory_id" "Management ID not found in Jamf Pro API response."
+    success "Found Computer ID: $computer_id and Management ID: $management_id"
+}
+
+## clear_failed_commands
+# Clears any pending or failed MDM commands for the device in Jamf Pro.
+clear_failed_commands() {
+  log "Clearing any existing failed or pending commands in Jamf Pro..."
+  local payload='{"statuses": ["FAILED", "PENDING"]}'
+
+  response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+    "$origin_jamf_url/api/v1/computers-inventory/$computer_id/commands/flush" \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -d "$payload")
+
+  http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
+  
+  if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]];
+  then
+    success "Successfully cleared failed/pending commands (HTTP $http_status)."
+  else
+    # This is non-critical, so we just log a warning and proceed.
+    log "WARN: Could not clear failed commands (HTTP $http_status). This is non-critical, proceeding anyway."
+  fi
+}
+
+## trigger_remote_wipe
+# Sends the 'EraseDevice' MDM command via the Jamf Pro API.
+trigger_remote_wipe() {
+    log "Initiating remote wipe via Jamf Pro API v2..."   
+    local payload
+    
+    payload=$(printf '{
+      "commandData": {
+        "commandType": "ERASE_DEVICE",
+        "obliterationBehavior": "Default",
+        "pin": "123456"
+      },
+      "clientData": [{"managementId": "%s"}]
+    }' "$management_id")
+
+    response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+     "$origin_jamf_url/api/v2/mdm/commands" \
+ 
+           -H "Authorization: Bearer $bearer_token" \
+        -H "Content-Type: application/json" \
+        -d "$payload")
+
+    http_status=$(echo "$response" | tail -n1 | cut -d: -f2)
+    
+    if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]];
+    then
+        success "EraseDevice command sent successfully (HTTP $http_status)."
+        # Deferral reset lines have been removed.
+        show_dialog_info "Wipe Command Sent" "The remote wipe command has been sent to this Mac. It will restart and erase itself shortly."
+        exit 0
+    else
+        err "trigger_remote_wipe" "Failed to send EraseDevice command. HTTP status: $http_status /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+    fi
+}
+
+# *MAIN EXECUTION*
+
+main() {
+  #  Initial Setup & Lock File Check 
+  setup_environment
+  log "Script started. Checking for existing instance..."
+  if [ -f "$LOCK_FILE" ];
+  then
+      local existing_pid
+      existing_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+      # Check if the PID in the lock file is a valid number and is still running
+      if [ -n "$existing_pid" ] && kill -0 "$existing_pid" &>/dev/null;
+      then
+          log "WARN: Lock file found for running PID $existing_pid. Another instance is active."
+          log "Activating existing dialog window and exiting."
+          currentUserUID=$(stat -f %u /dev/console)
+          # Check if we got a valid user (not 0, which is root)
+          if [ -n "$currentUserUID" ] && [ "$currentUserUID" -ne 0 ];
+          then
+              log "Found logged-in user UID: $currentUserUID. Attempting to activate PID: $existing_pid"
+              launchctl asuser "$currentUserUID" osascript -e "tell application \"System Events\" to tell (process id $existing_pid) to set frontmost to true"
+          else
+              log "WARN: Could not determine active user. Unable to bring dialog to front."
+          fi
+          exit 0 # Exit 0 to satisfy the LaunchDaemon
+      else
+          log "WARN: Stale lock file found. Removing and proceeding."
+          rm "$LOCK_FILE"
+      fi
+  fi
+  # Create the new lock file with our PID
+  echo "$$" > "$LOCK_FILE"
+  log "Lock file created for PID $$."
+  
+  # Critical Checks 
+  check_hardware_support
+  
+  # Deferral Check 
+  # The check_deferral function has been removed.
+  # The script will now proceed directly to the user dialogs.
+
+  #  User Dialogs 
+  show_requirements_dialog
+  show_data_backup_dialog
+
+  #  Run all pre-flight checks 
+  log "Starting pre-flight checks..."
+  check_os_version
+  check_device_power_type
+  check_jamf_connectivity
+  check_apns_connectivity
+  check_jamf_enrollment
+  check_mdm_profile
+  log "All pre-flight checks passed."
+  
+  #  Get Jamf Info 
+  get_jamf_auth_token
+  get_computer_inventory_id
+  clear_failed_commands
+
+  #  Close User Apps 
+  kill_user_apps
+
+  #  Execute Wipe 
+  if $dry_run;
+  then
+    success "[DRY-RUN] Migration would have proceeded. Device wipe command not sent."
+    show_dialog_info "Dry-Run Complete" "All checks passed successfully. In a real run, the wipe command would have been sent."
+  else
+    trigger_remote_wipe
+  fi
+}
+
+main "$@"
