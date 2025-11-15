@@ -4,16 +4,15 @@
 # Purpose: Migrate Apple Macs from StratMac (MOTM) to LBG Business Jamf Pro instance
 # Date: 07/11/2025
 
-#
-# ─── PRE-FLIGHT USER CHECK ───────────────────────────────────────────────────
-#
+# *PRE-FLIGHT USER CHECK*
+
 # This script must run as root (via the LaunchDaemon) but interact with the
 # currently logged-in user.
-#
+
 # If no user is logged in (e.g., at the login window), we must exit with a
 # non-zero status. This tells the LaunchDaemon to retry later (based on its
 # ThrottleInterval) instead of succeeding and disabling itself.
-#
+
 LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
 if [ -z "$LOGGED_IN_USER" ];
 then
@@ -22,19 +21,17 @@ then
     exit 1
 fi
 
-#
-# ─── SCRIPT CONFIGURATION ─────────────────────────────────────────────────────
-#
+# *SCRIPT CONFIGURATION*
 
-# --- Deferral Settings ---
+# Deferral Settings 
 MAX_DEFERRALS=5
 PLIST_PATH="/Users/$LOGGED_IN_USER/Library/Application Support/LBG/com.lbg.jamf-migration.plist"
 
-# --- SwiftDialog Settings ---
+# SwiftDialog Settings 
 DIALOG_BINARY="/usr/local/bin/dialog"
 BRANDING_ICON="/Users/Shared/LBG_Branding_Cancara/lbg_primary_logo.png"
 
-# --- Jamf API Credentials & Endpoints (Passed as script parameters) ---
+# Jamf API Credentials & Endpoints (Passed as script parameters) 
 JAMF_CLIENT_ID="${4:-$JAMF_CLIENT_ID}"
 JAMF_CLIENT_SECRET="${5:-$JAMF_CLIENT_SECRET}"
 ORIGIN_JAMF_URL="${6:-$ORIGIN_JAMF_URL}"
@@ -42,18 +39,15 @@ TARGET_JAMF_URL="${7:-$TARGET_JAMF_URL}"
 DRY_RUN="${8:-${DRY_RUN:-false}}"
 JAMF_POLICY_ID="${9:-$JAMF_POLICY_ID}"
 
-# --- Process Lock File ---
-# This file prevents multiple instances of the script from running and
-# showing multiple dialogs to the user.
+# Process Lock File 
+# This file prevents multiple instances of the script from running and showing multiple dialogs to the user.
 LOCK_FILE="/var/tmp/com.lbg.jamf-migration.lock"
 
-# --- Global Variables ---
+# Global Variables 
 management_id=""
 computer_id=""
 
-#
-# ─── LOGGING AND UTILITIES ────────────────────────────────────────────────────
-#
+# *LOGGING AND UTILITIES*
 
 LOG_FILE="/Users/$LOGGED_IN_USER/jamf_migration_preflight.log"
 
@@ -101,7 +95,7 @@ err() {
 }
 
 ## run_cmd
-# Wrapper to execute commands, respecting dry_run mode (currently for 'kill').
+# Wrapper to execute commands, respecting dry_run mode
 run_cmd() {
   if $dry_run && [[ "$1" == "kill" ]];
   then
@@ -118,7 +112,6 @@ urlencode() {
     local strlen=${#string}
     local encoded=""
     local pos c o
-
     for (( pos=0 ; pos<strlen ; pos++ )); do
         c=${string:$pos:1}
         case "$c" in
@@ -130,10 +123,7 @@ urlencode() {
     echo "${encoded}"
 }
 
-
-#
-# ─── SWIFTDIALOG FUNCTIONS ────────────────────────────────────────────────────
-#
+# *SWIFTDIALOG FUNCTIONS*
 
 ## show_dialog_error
 # Displays a standardized error dialog.
@@ -158,10 +148,7 @@ show_dialog_confirm() {
     return $?
 }
 
-
-#
-# ─── DEFERRAL & SCHEDULING FUNCTIONS ──────────────────────────────────────────
-#
+# *DEFERRAL & SCHEDULING FUNCTIONS*
 
 ## schedule_relaunch
 # Creates and loads a new, unique LaunchDaemon to re-run the migration policy after a specified delay.
@@ -176,7 +163,7 @@ schedule_relaunch() {
     local new_daemon_path="/Library/LaunchDaemons/$new_label.plist"
     log "Creating new daemon: $new_label"
     
-    # This script (run by the *old* daemon) will exit 0.
+    # This script (run by the old daemon) will exit 0.
     # The old daemon's 'KeepAlive = { SuccessfulExit = false }' key will cause it to stop and unload itself.
     # We only need to create and load the *new* one.
     cat << EOF > "$new_daemon_path"
@@ -235,7 +222,6 @@ handle_deferral() {
     deferral_count=$((deferral_count + 1))
     defaults write "$PLIST_PATH" DeferralCount -int "$deferral_count"
     log "User deferred. New count: $deferral_count."
-
     local future_hour future_minute friendly_time
     local seconds_to_wait
     local now_epoch
@@ -257,7 +243,7 @@ handle_deferral() {
     # Check for "Cancel" (non-zero exit code)
     [[ $? -ne 0 ]] && log "User cancelled deferral selection." && exit 0
     
-    # Parse the JSON to get the deferal key (e.g., "1h")
+    # Parse the JSON to get the deferal key
     local defer_choice
     defer_choice=$(jq -r '.["Deferral Options"].selectedValue | split(":")[0]' <<< "$defer_choice_json")
     log "Parsed defer_choice from swiftDialog JSON: '$defer_choice'"
@@ -345,7 +331,6 @@ handle_deferral() {
     defaults write "$PLIST_PATH" NextRunEpoch -int "$next_run_epoch"
     log "Storing next run epoch: $next_run_epoch (i.e., $(date -r $next_run_epoch))"
     schedule_relaunch "$seconds_to_wait"
-    
     show_dialog_info "Migration Deferred" "You will be reminded $friendly_time."
     
     # chown the plist, as this function may create it as root.
@@ -371,7 +356,6 @@ check_deferral() {
     # Read the stored epoch time, default to 0 if not found
     next_run_epoch=$(defaults read "$PLIST_PATH" NextRunEpoch 2>/dev/null || echo 0)
     now_epoch=$(date +%s)
-    
     if [[ "$next_run_epoch" -gt "$now_epoch" ]];
     then
       # A deferral is active and the time has not yet passed, script was likely re-triggered in error. Exit silently.
@@ -398,7 +382,6 @@ check_deferral() {
   
   deferral_count=$(defaults read "$PLIST_PATH" DeferralCount 2>/dev/null || echo 0)
   remaining_deferrals=$((MAX_DEFERRALS - deferral_count))
-
   log "Deferral count: $deferral_count. Remaining: $remaining_deferrals."
   
   if [ "$remaining_deferrals" -le 0 ]; then
@@ -462,10 +445,7 @@ Please double-check that OneDrive has finished syncing all your important files.
     success "User has explicitly confirmed data backup and accepts migration."
 }
 
-
-#
-# ─── ENVIRONMENT & PREFLIGHT CHECKS ───────────────────────────────────────────
-#
+# *ENVIRONMENT & PREFLIGHT CHECKS*
 
 ## setup_environment
 # Validates all required script parameters and binary dependencies.
@@ -537,7 +517,6 @@ check_os_version() {
 # Checks for basic network connectivity to the origin Jamf Pro server.
 check_jamf_connectivity() {
   log "Determining active network service…"
-  
   local jamf_host
   jamf_host=$(echo "$origin_jamf_url" | awk -F/ '{print $3}')
 
@@ -608,7 +587,6 @@ check_apns_connectivity() {
 kill_user_apps() {
   local excluded_patterns=("Self Service" "Terminal" "Finder" "dialog" "jamf" "Jamf" "Symantec" "WSS")
   log "Starting graceful application termination..."
-  
   local app_pids=()
   # Find processes running from the /Applications directory
   ps -ax -o pid,command | grep "/Applications/.*\.app/" | grep -v grep | while read -r pid command;
@@ -643,10 +621,7 @@ kill_user_apps() {
   done
 }
 
-
-#
-# ─── JAMF PRO API FUNCTIONS ───────────────────────────────────────────────────
-#
+# *JAMF PRO API FUNCTIONS*
 
 ## get_jamf_auth_token
 # Obtains a Bearer Token from the origin Jamf Pro API.
@@ -752,13 +727,10 @@ trigger_remote_wipe() {
     fi
 }
 
-
-#
-# ─── MAIN EXECUTION ───────────────────────────────────────────────────────────
-#
+# *MAIN EXECUTION*
 
 main() {
-  # --- Initial Setup & Lock File Check ---
+  #  Initial Setup & Lock File Check 
   setup_environment
   log "Script started. Checking for existing instance..."
   if [ -f "$LOCK_FILE" ]; then
@@ -786,19 +758,18 @@ main() {
   echo "$$" > "$LOCK_FILE"
   log "Lock file created for PID $$."
 
-  # --- Critical Checks ---
+  # Critical Checks 
   check_hardware_support
   
-  # --- Deferral Check ---
-  # This function also contains the guard logic for active deferrals.
-  # If the user defers, this function will call `exit 0`.
+  # Deferral Check 
+  # This function also contains the guard logic for active deferrals. If the user defers, this function will call `exit 0`.
   check_deferral
 
-  # --- User Dialogs ---
+  #  User Dialogs 
   show_requirements_dialog
   show_data_backup_dialog
 
-  # --- Run all pre-flight checks ---
+  #  Run all pre-flight checks 
   log "Starting pre-flight checks..."
   check_os_version
   check_device_power_type
@@ -808,15 +779,15 @@ main() {
   check_mdm_profile
   log "All pre-flight checks passed."
   
-  # --- Get Jamf Info ---
+  #  Get Jamf Info 
   get_jamf_auth_token
   get_computer_inventory_id
   clear_failed_commands
 
-  # --- Close User Apps ---
+  #  Close User Apps 
   kill_user_apps
 
-  # --- Execute Wipe ---
+  #  Execute Wipe 
   if $dry_run;
   then
     success "[DRY-RUN] Migration would have proceeded. Device wipe command not sent."
