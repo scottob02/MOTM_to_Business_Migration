@@ -1,0 +1,135 @@
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+echo "--- Jamf Pro Full Import Generator ---"
+echo
+echo "This script will create two files:"
+echo " 1. categories.tf: Empty resource blocks for your categories."
+echo " 2. import.sh:      A script to import those categories into Terraform."
+echo
+
+# --- 1. Get Credentials ---
+# Prompt the user for their Jamf Pro credentials
+read -p "Enter your Jamf Pro URL (e.g., mycompany.jamfcloud.com): " JAMF_URL
+read -p "Enter your Jamf Pro Client ID: " JAMF_CLIENT_ID
+read -sp "Enter your Jamf Pro Client Secret: " JAMF_CLIENT_SECRET
+echo # Newline after secret
+
+# Clean the URL (remove trailing slash)
+JAMF_URL_CLEAN=$(echo $JAMF_URL | sed 's:/*$::')
+
+# --- 2. Get API Token ---
+echo
+echo "Attempting to get API token from $JAMF_URL_CLEAN..."
+
+TOKEN_RESPONSE=$(curl --silent --show-error \
+  --request POST \
+  --url "${JAMF_URL_CLEAN}/api/oauth/token" \
+  --header "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "client_id=${JAMF_CLIENT_ID}" \
+  --data-urlencode "client_secret=${JAMF_CLIENT_SECRET}")
+
+# Parse the token from the JSON response using jq
+ACCESS_TOKEN=$(echo $TOKEN_RESPONSE | jq -r .access_token)
+
+if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+  echo "Error: Could not get access token. Check your credentials and URL."
+  echo "Response: $TOKEN_RESPONSE"
+  exit 1
+fi
+
+echo "Successfully obtained API token."
+
+# --- 3. Get Categories from Jamf API ---
+echo "Fetching categories from ${JAMF_URL_CLEAN}/api/v1/categories..."
+
+CATEGORIES_JSON=$(curl --silent --show-error \
+  --request GET \
+  --url "${JAMF_URL_CLEAN}/api/v1/categories" \
+  --header "Authorization: Bearer ${ACCESS_TOKEN}")
+
+if [ -z "$CATEGORIES_JSON" ]; then
+  echo "Error: Failed to fetch categories. No response from API."
+  exit 1
+fi
+
+# --- 4. Generate Terraform and Import Files ---
+echo "Generating categories.tf and import.sh..."
+
+# Create or clear the files
+> categories.tf
+> import.sh
+
+# Make the import.sh script executable
+chmod +x import.sh
+
+# Write the header for the import.sh script
+# This exports the credentials as Terraform variables
+# Assumes your main.tf is configured to read these variables
+cat << EOF > import.sh
+#!/bin/bash
+# This script was auto-generated.
+set -e
+
+# Export credentials for Terraform to use
+export TF_VAR_jamf_url="${JAMF_URL_CLEAN}"
+export TF_VAR_jamf_client_id="${JAMF_CLIENT_ID}"
+export TF_VAR_jamf_client_secret="${JAMF_CLIENT_SECRET}"
+
+echo "Ensuring Terraform is initialized..."
+# Run init in case it hasn't been run
+terraform init
+
+echo "Starting import... This may take a moment."
+echo
+EOF
+
+# Loop through the JSON array of categories
+CATEGORY_COUNT=0
+echo "$CATEGORIES_JSON" | jq -c '.categories[] | {id: .id, name: .name}' | while read -r category_json; do
+  
+  # Get the id and name for this category
+  JAMF_ID=$(echo "$category_json" | jq -r '.id')
+  JAMF_NAME=$(echo "$category_json" | jq -r '.name')
+
+  # Sanitize the Jamf name to be a valid Terraform resource name
+  TF_NAME=$(echo "$JAMF_NAME" | tr '[:upper:]' '[:lower:]' | \
+    tr -cs '[:alnum:]' '_' | \
+    sed 's/^_*//;s/_*$//;s/__*/_/g')
+
+  if [ -z "$TF_NAME" ]; then
+    TF_NAME="category_${JAMF_ID}" # Fallback if name is only special chars
+  fi
+
+  echo "  -> Processing '$JAMF_NAME' (ID: $JAMF_ID) as 'jamfpro_category.${TF_NAME}'"
+
+  # 1. Append the empty resource block to categories.tf
+  cat << EOF >> categories.tf
+resource "jamfpro_category" "${TF_NAME}" {
+  # Imported resource: '$JAMF_NAME' (ID: $JAMF_ID)
+  # TODO: Manually add the 'name' and 'priority' arguments after import.
+  # name     = "$JAMF_NAME"
+  # priority = 10 # <-- Set this
+}
+
+EOF
+
+  # 2. Append the import command to import.sh
+  #    We must quote the resource address
+  echo "echo \"Importing '$JAMF_NAME' (ID: $JAMF_ID)...\"" >> import.sh
+  echo "terraform import 'jamfpro_category.${TF_NAME}' ${JAMF_ID}" >> import.sh
+  echo # Add a newline for readability in the import script
+
+  CATEGORY_COUNT=$((CATEGORY_COUNT + 1))
+done
+
+echo
+echo "--- Success! ---"
+echo "Generated:"
+echo "  * categories.tf (contains ${CATEGORY_COUNT} resource blocks)"
+echo "  * import.sh (contains ${CATEGORY_COUNT} import commands)"
+echo
+echo "Next, review the generated files and then run: ./import.sh"
