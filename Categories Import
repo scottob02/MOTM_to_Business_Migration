@@ -11,13 +11,11 @@ echo " 2. import.sh:      A script to import those categories into Terraform."
 echo
 
 # --- 1. Get Credentials ---
-# Prompt the user for their Jamf Pro credentials
 read -p "Enter your Jamf Pro URL (e.g., mycompany.jamfcloud.com): " JAMF_URL
 read -p "Enter your Jamf Pro Client ID: " JAMF_CLIENT_ID
 read -sp "Enter your Jamf Pro Client Secret: " JAMF_CLIENT_SECRET
 echo # Newline after secret
 
-# Clean the URL (remove trailing slash)
 JAMF_URL_CLEAN=$(echo $JAMF_URL | sed 's:/*$::')
 
 # --- 2. Get API Token ---
@@ -32,8 +30,18 @@ TOKEN_RESPONSE=$(curl --silent --show-error \
   --data-urlencode "client_id=${JAMF_CLIENT_ID}" \
   --data-urlencode "client_secret=${JAMF_CLIENT_SECRET}")
 
-# Parse the token from the JSON response using jq
-ACCESS_TOKEN=$(echo $TOKEN_RESPONSE | jq -r .access_token)
+# --- NEW ERROR CHECK ---
+# Check if the response is valid JSON before trying to parse it
+if ! echo "$TOKEN_RESPONSE" | jq -e . >/dev/null 2>&1; then
+  echo "Error: API did not return valid JSON for token request."
+  echo "This often means your URL or credentials are incorrect."
+  echo "Response was:"
+  echo "$TOKEN_RESPONSE"
+  exit 1
+fi
+# --- END NEW CHECK ---
+
+ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .access_token)
 
 if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
   echo "Error: Could not get access token. Check your credentials and URL."
@@ -56,19 +64,25 @@ if [ -z "$CATEGORIES_JSON" ]; then
   exit 1
 fi
 
+# --- NEW ERROR CHECK ---
+# Check if the response is valid JSON before trying to parse it
+if ! echo "$CATEGORIES_JSON" | jq -e . >/dev/null 2>&1; then
+  echo "Error: API did not return valid JSON for categories request."
+  echo "This can happen if your token is invalid or has insufficient permissions."
+  echo "Response was:"
+  echo "$CATEGORIES_JSON"
+  exit 1
+fi
+# --- END NEW CHECK ---
+
 # --- 4. Generate Terraform and Import Files ---
 echo "Generating categories.tf and import.sh..."
 
-# Create or clear the files
 > categories.tf
 > import.sh
-
-# Make the import.sh script executable
 chmod +x import.sh
 
 # Write the header for the import.sh script
-# This exports the credentials as Terraform variables
-# Assumes your main.tf is configured to read these variables
 cat << EOF > import.sh
 #!/bin/bash
 # This script was auto-generated.
@@ -80,7 +94,6 @@ export TF_VAR_jamf_client_id="${JAMF_CLIENT_ID}"
 export TF_VAR_jamf_client_secret="${JAMF_CLIENT_SECRET}"
 
 echo "Ensuring Terraform is initialized..."
-# Run init in case it hasn't been run
 terraform init
 
 echo "Starting import... This may take a moment."
@@ -91,7 +104,6 @@ EOF
 CATEGORY_COUNT=0
 echo "$CATEGORIES_JSON" | jq -c '.categories[] | {id: .id, name: .name}' | while read -r category_json; do
   
-  # Get the id and name for this category
   JAMF_ID=$(echo "$category_json" | jq -r '.id')
   JAMF_NAME=$(echo "$category_json" | jq -r '.name')
 
@@ -101,7 +113,7 @@ echo "$CATEGORIES_JSON" | jq -c '.categories[] | {id: .id, name: .name}' | while
     sed 's/^_*//;s/_*$//;s/__*/_/g')
 
   if [ -z "$TF_NAME" ]; then
-    TF_NAME="category_${JAMF_ID}" # Fallback if name is only special chars
+    TF_NAME="category_${JAMF_ID}"
   fi
 
   echo "  -> Processing '$JAMF_NAME' (ID: $JAMF_ID) as 'jamfpro_category.${TF_NAME}'"
@@ -118,10 +130,9 @@ resource "jamfpro_category" "${TF_NAME}" {
 EOF
 
   # 2. Append the import command to import.sh
-  #    We must quote the resource address
   echo "echo \"Importing '$JAMF_NAME' (ID: $JAMF_ID)...\"" >> import.sh
   echo "terraform import 'jamfpro_category.${TF_NAME}' ${JAMF_ID}" >> import.sh
-  echo # Add a newline for readability in the import script
+  echo >> import.sh
 
   CATEGORY_COUNT=$((CATEGORY_COUNT + 1))
 done
