@@ -1,146 +1,227 @@
 #!/bin/bash
+set -eo pipefail
 
-# Exit immediately if a command exits with a non-zero status.
-set -e
+# --- Prerequisite Check ---
+if ! command -v curl &> /dev/null; then
+    echo "Error: This script requires 'curl'. Please install it to proceed." >&2
+    exit 1
+fi
+if ! command -v jq &> /dev/null; then
+    echo "Error: This script requires 'jq'. Please install it to proceed." >&2
+    exit 1
+fi
 
-echo "--- Jamf Pro Full Import Generator ---"
+echo "--- Jamf Pro 'Category' to Terraform Import Script ---"
 echo
-echo "This script will create two files:"
-echo " 1. categories.tf: Empty resource blocks for your categories."
-echo " 2. import.sh:      A script to import those categories into Terraform."
-echo
 
-# --- 1. Get Credentials ---
-read -p "Enter your Jamf Pro URL (e.g., mycompany.jamfcloud.com): " JAMF_URL
+# --- 1. Get User Credentials ---
+read -p "Enter your Jamf Pro URL (e.g., https://myjamf.jamfcloud.com): " JAMF_URL
 read -p "Enter your Jamf Pro Client ID: " JAMF_CLIENT_ID
 read -sp "Enter your Jamf Pro Client Secret: " JAMF_CLIENT_SECRET
-echo # Newline after secret
+echo # Newline after secret input
 
-JAMF_URL_CLEAN=$(echo $JAMF_URL | sed 's:/*$::')
+# Clean trailing slash from URL if present
+JAMF_URL=${JAMF_URL%/}
 
-# --- 2. Get API Token ---
+# --- 2. Authenticate and Get Token ---
 echo
-echo "Attempting to get API token from $JAMF_URL_CLEAN..."
-
-TOKEN_RESPONSE=$(curl --silent --show-error \
-  --request POST \
-  --url "${JAMF_URL_CLEAN}/api/oauth/token" \
-  --header "Content-Type: application/x-www-form-urlencoded" \
-  --data-urlencode "grant_type=client_credentials" \
-  --data-urlencode "client_id=${JAMF_CLIENT_ID}" \
-  --data-urlencode "client_secret=${JAMF_CLIENT_SECRET}")
-
-# --- NEW ERROR CHECK ---
-# Check if the response is valid JSON before trying to parse it
-if ! echo "$TOKEN_RESPONSE" | jq -e . >/dev/null 2>&1; then
-  echo "Error: API did not return valid JSON for token request."
-  echo "This often means your URL or credentials are incorrect."
-  echo "Response was:"
-  echo "$TOKEN_RESPONSE"
-  exit 1
-fi
-# --- END NEW CHECK ---
+echo "Attempting to get auth token from ${JAMF_URL}..."
+TOKEN_RESPONSE=$(curl -s -X POST \
+  "${JAMF_URL}/api/oauth/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "client_id=${JAMF_CLIENT_ID}" \
+  -d "client_secret=${JAMF_CLIENT_SECRET}" \
+  -d "grant_type=client_credentials")
 
 ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .access_token)
 
 if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
-  echo "Error: Could not get access token. Check your credentials and URL."
-  echo "Response: $TOKEN_RESPONSE"
+  echo "Error: Failed to get access token." >&2
+  echo "Response: $TOKEN_RESPONSE" >&2
+  unset JAMF_CLIENT_SECRET # Clear secret from memory
   exit 1
 fi
-
-echo "Successfully obtained API token."
-
-# --- 3. Get Categories from Jamf API ---
-echo "Fetching categories from ${JAMF_URL_CLEAN}/api/v1/categories..."
-
-CATEGORIES_JSON=$(curl --silent --show-error \
-  --request GET \
-  --url "${JAMF_URL_CLEAN}/api/v1/categories" \
-  --header "Authorization: Bearer ${ACCESS_TOKEN}")
-
-if [ -z "$CATEGORIES_JSON" ]; then
-  echo "Error: Failed to fetch categories. No response from API."
-  exit 1
-fi
-
-# --- NEW ERROR CHECK ---
-# Check if the response is valid JSON before trying to parse it
-if ! echo "$CATEGORIES_JSON" | jq -e . >/dev/null 2>&1; then
-  echo "Error: API did not return valid JSON for categories request."
-  echo "This can happen if your token is invalid or has insufficient permissions."
-  echo "Response was:"
-  echo "$CATEGORIES_JSON"
-  exit 1
-fi
-# --- END NEW CHECK ---
-
-# --- 4. Generate Terraform and Import Files ---
-echo "Generating categories.tf and import.sh..."
-
-> categories.tf
-> import.sh
-chmod +x import.sh
-
-# Write the header for the import.sh script
-cat << EOF > import.sh
-#!/bin/bash
-# This script was auto-generated.
-set -e
-
-# Export credentials for Terraform to use
-export TF_VAR_jamf_url="${JAMF_URL_CLEAN}"
-export TF_VAR_jamf_client_id="${JAMF_CLIENT_ID}"
-export TF_VAR_jamf_client_secret="${JAMF_CLIENT_SECRET}"
-
-echo "Ensuring Terraform is initialized..."
-terraform init
-
-echo "Starting import... This may take a moment."
+echo "✅ Successfully authenticated."
 echo
+
+# Clear the secret from memory
+unset JAMF_CLIENT_SECRET
+
+# --- 3. Resource Configuration (Hardcoded for Categories) ---
+
+# Terraform resource type
+TF_RESOURCE_TYPE="jamfpro_category"
+# API endpoint to list all resources
+LIST_API_ENDPOINT="/api/v1/categories"
+# API endpoint template to get a single resource's details. ${ITEM_ID} will be appended.
+DETAIL_API_ENDPOINT_TEMPLATE="/api/v1/categories/"
+# The key in the LIST response JSON that contains the array of results
+LIST_JSON_RESULTS_KEY="results"
+# The key in the LIST item's JSON for its ID
+LIST_JSON_ID_KEY="id"
+# The key in the LIST item's JSON for its Name (used as the 'for_each' key)
+LIST_JSON_NAME_KEY="name"
+
+# This JQ query filters the FULL detail JSON from the API
+# into a clean object for our Terraform 'locals' map.
+# We only take the keys the 'jamfpro_category' resource manages.
+JQ_TRANSFORM_QUERY="{
+  name: .name,
+  priority: .priority
+}"
+
+# This is the literal HCL content that will be written inside the
+# 'resource' block, referencing the 'each.value' from the map.
+HCL_RESOURCE_CONTENT=$(cat <<'EOF'
+  name     = each.value.name
+  priority = each.value.priority
 EOF
+)
 
-# Loop through the JSON array of categories
-CATEGORY_COUNT=0
-echo "$CATEGORIES_JSON" | jq -c '.categories[] | {id: .id, name: .name}' | while read -r category_json; do
+echo "Configuration set for 'jamfpro_category'."
+echo
+
+# --- 4. Fetch All Categories (List + Detail Loop) ---
+echo "Fetching all categories from ${JAMF_URL}..."
+LIST_RESPONSE=$(curl -s -X GET \
+  "${JAMF_URL}${LIST_API_ENDPOINT}" \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}")
+
+# Check for valid response
+if [ -z "$LIST_RESPONSE" ] || ! echo "$LIST_RESPONSE" | jq -e 'has($key)' --arg key "$LIST_JSON_RESULTS_KEY" > /dev/null; then
+    echo "Error: Received empty or invalid response from list endpoint." >&2
+    echo "Response: $LIST_RESPONSE" >&2
+    unset ACCESS_TOKEN
+    exit 1
+fi
+
+ITEM_COUNT=$(echo "$LIST_RESPONSE" | jq -r ".${LIST_JSON_RESULTS_KEY} | length")
+if [ "$ITEM_COUNT" -eq 0 ]; then
+    echo "No categories found in Jamf Pro. Exiting."
+    unset ACCESS_TOKEN
+    exit 0
+fi
+echo "Found ${ITEM_COUNT} categories. Fetching full details..."
+
+# Initialize our final map and import commands
+FINAL_HCL_MAP="{}"
+IMPORT_COMMANDS=""
+PROCESSED_COUNT=0
+
+# Loop over the summary list (using jq to read each JSON object)
+while read -r item_summary; do
+  ITEM_ID=$(echo "$item_summary" | jq -r ".$LIST_JSON_ID_KEY")
+  ITEM_NAME=$(echo "$item_summary" | jq -r ".$LIST_JSON_NAME_KEY")
   
-  JAMF_ID=$(echo "$category_json" | jq -r '.id')
-  JAMF_NAME=$(echo "$category_json" | jq -r '.name')
-
-  # Sanitize the Jamf name to be a valid Terraform resource name
-  TF_NAME=$(echo "$JAMF_NAME" | tr '[:upper:]' '[:lower:]' | \
-    tr -cs '[:alnum:]' '_' | \
-    sed 's/^_*//;s/_*$//;s/__*/_/g')
-
-  if [ -z "$TF_NAME" ]; then
-    TF_NAME="category_${JAMF_ID}"
+  # Handle items with no name
+  if [ "$ITEM_NAME" == "null" ] || [ -z "$ITEM_NAME" ]; then
+    echo "Skipping item with ID $ITEM_ID: Name is missing."
+    continue
   fi
 
-  echo "  -> Processing '$JAMF_NAME' (ID: $JAMF_ID) as 'jamfpro_category.${TF_NAME}'"
+  PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+  echo "  ($PROCESSED_COUNT/$ITEM_COUNT) Fetching details for: \"${ITEM_NAME}\" (ID: ${ITEM_ID})"
 
-  # 1. Append the empty resource block to categories.tf
-  cat << EOF >> categories.tf
-resource "jamfpro_category" "${TF_NAME}" {
-  # Imported resource: '$JAMF_NAME' (ID: $JAMF_ID)
-  # TODO: Manually add the 'name' and 'priority' arguments after import.
-  # name     = "$JAMF_NAME"
-  # priority = 10 # <-- Set this
-}
+  # Call the detail endpoint for the specific item
+  DETAIL_RESPONSE=$(curl -s -X GET \
+    "${JAMF_URL}${DETAIL_API_ENDPOINT_TEMPLATE}${ITEM_ID}" \
+    -H "Authorization: Bearer ${ACCESS_TOKEN}")
+    
+  if [ -z "$DETAIL_RESPONSE" ] || [ "$(echo "$DETAIL_RESPONSE" | jq -r '.name? // .id?')" == "null" ]; then
+    echo "  WARNING: Failed to get details for ID $ITEM_ID. Skipping."
+    continue
+  fi
 
-EOF
+  # Use the resource-specific JQ_TRANSFORM_QUERY to clean the JSON
+  HCL_ATTRIBUTES_JSON=$(echo "$DETAIL_RESPONSE" | jq -c "$JQ_TRANSFORM_QUERY")
+  
+  if [ -z "$HCL_ATTRIBUTES_JSON" ]; then
+    echo "  WARNING: JQ transform failed for ID $ITEM_ID. Skipping."
+    continue
+  fi
 
-  # 2. Append the import command to import.sh
-  echo "echo \"Importing '$JAMF_NAME' (ID: $JAMF_ID)...\"" >> import.sh
-  echo "terraform import 'jamfpro_category.${TF_NAME}' ${JAMF_ID}" >> import.sh
-  echo >> import.sh
+  # Add this item's clean JSON to our final map, keyed by its name
+  FINAL_HCL_MAP=$(echo "$FINAL_HCL_MAP" | jq -c \
+    --arg key "$ITEM_NAME" \
+    --argjson value "$HCL_ATTRIBUTES_JSON" \
+    '. + {($key): $value}')
 
-  CATEGORY_COUNT=$((CATEGORY_COUNT + 1))
-done
+  # Add the import command to our script string
+  IMPORT_COMMANDS+=$(printf "terraform import '%s.imported_categories[\"%s\"]' '%s'\n" \
+    "$TF_RESOURCE_TYPE" \
+    "$ITEM_NAME" \
+    "$ITEM_ID")
 
+done < <(echo "$LIST_RESPONSE" | jq -c ".${LIST_JSON_RESULTS_KEY}[]")
+
+echo "✅ All ${PROCESSED_COUNT} items processed."
 echo
-echo "--- Success! ---"
-echo "Generated:"
-echo "  * categories.tf (contains ${CATEGORY_COUNT} resource blocks)"
-echo "  * import.sh (contains ${CATEGORY_COUNT} import commands)"
+
+# --- 5. Generate Terraform HCL File ---
+HCL_FILE="categories.tf"
+TF_VAR_NAME="categories_map"
+TF_RESOURCE_NAME="imported_categories"
+
+echo "Generating ${HCL_FILE}..."
+
+# Write the HCL file
+{
+  echo "# This file was automatically generated by the Jamf import script"
+  echo "# It defines all categories using a 'for_each' loop"
+  echo
+  echo "locals {"
+  # Pretty-print the JSON map into the HCL file
+  echo "  ${TF_VAR_NAME} = $(echo "$FINAL_HCL_MAP" | jq '.')"
+  echo "}"
+  echo
+  echo "resource \"${TF_RESOURCE_TYPE}\" \"${TF_RESOURCE_NAME}\" {"
+  echo "  for_each = local.${TF_VAR_NAME}"
+  echo
+  # Inject the resource-specific HCL content
+  echo "${HCL_RESOURCE_CONTENT}"
+  echo "}"
+} > "$HCL_FILE"
+
+# --- 6. Generate Import Shell Script ---
+IMPORT_FILE="import_categories.sh"
+echo "Generating ${IMPORT_FILE}..."
+
+{
+  echo "#!/bin/bash"
+  echo "# Run this script to import all ${PROCESSED_COUNT} categories into your Terraform state."
+  echo "# Make sure you have run 'terraform init' and are authenticated."
+  echo "# This script is safe to re-run; 'import' will only update the state."
+  echo
+  echo "$IMPORT_COMMANDS"
+} > "$IMPORT_FILE"
+
+# Make the import script executable
+chmod +x "$IMPORT_FILE"
+
+# --- 7. Final Instructions ---
+unset ACCESS_TOKEN # Clear auth token
 echo
-echo "Next, review the generated files and then run: ./import.sh"
+echo "---"
+echo "✅ Success! Two files have been created:"
+echo
+echo "1. ${HCL_FILE}"
+echo "   This is your complete Terraform HCL code for all categories."
+echo
+echo "2. ${IMPORT_FILE}"
+echo "   This is a shell script to import all ${PROCESSED_COUNT} categories into"
+echo "   your Terraform state file."
+echo
+echo "--- 🚀 Your Migration Plan ---"
+echo "1. Run 'terraform init' in this directory (if you haven't already)."
+echo "2. Execute the import script: ./$IMPORT_FILE"
+echo "3. Run 'terraform plan'."
+echo
+echo "   *************************************************"
+echo "   The plan should now show 'No changes' or"
+echo "   only minimal, non-functional changes."
+echo "   Your categories are now fully managed by code!"
+echo "   *************************************************"
+echo
+echo "4. You can now commit ${HCL_FILE} to your Git repository."
+echo
+echo "Migration generation complete. Good luck!"
