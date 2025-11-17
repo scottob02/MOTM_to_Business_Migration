@@ -157,12 +157,11 @@ show_requirements_dialog() {
     message+="* **Internet:** A stable internet connection throughout the entire migration is required.\n"
     message+="* **Data Backed-up:** Any information, files, or notes you wish to keep must be saved and uploaded to OneDrive. Anything not stored in OneDrive will be permanetly deleted (and cannot be recovered). \n\n"
     message+="Additionally this process will close all open applications and then perform a factory reset which will wipe all data from your Mac."
-    
     if ! show_dialog_confirm "Migration Requirements" "$message" "I Understand, Continue" "Cancel";
     then
-        log "User cancelled at the requirements screen."
-        exit 0
-    fi
+            log "User cancelled at the requirements screen."
+    exit 0
+        fi
 }
 
 ## show_data_backup_dialog
