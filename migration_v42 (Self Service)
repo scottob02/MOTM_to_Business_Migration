@@ -215,7 +215,7 @@ setup_environment() {
     
     # Validate required binaries
     if [[ ! -x "$DIALOG_BINARY" ]]; then
-      err "setup_environment" "swiftDialog not found at $DIALOG_BINARY. Please install it. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+      err "setup_environment" "swiftDialog not found at $DIALOG_BINARY. Please install it. \n\n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in \n\n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
     fi
     success "Required binaries (dialog) found."
 
@@ -256,7 +256,7 @@ check_os_version() {
 
     if [[ "$os_major_version" -lt 12 ]];
     then
-        err "check_os_version" "macOS version ($OS_VERSION) is older than macOS 12. Local 'Erase All Content and Settings' is not supported. /n/n Please submit a Mac Fault via IT@LBG for assistance."
+        err "check_os_version" "macOS version ($OS_VERSION) is older than macOS 12. Local 'Erase All Content and Settings' is not supported. \n\n Please submit a Mac Fault via IT@LBG for assistance."
     else
         success "macOS version ($OS_VERSION) supports local erase."
     fi
@@ -270,7 +270,7 @@ check_jamf_connectivity() {
   jamf_host=$(echo "$origin_jamf_url" | awk -F/ '{print $3}')
 
   if ! curl -s --head --connect-timeout 5 "$origin_jamf_url" >/dev/null 2>&1; then
-      err "check_jamf_connectivity" "No connectivity to your Jamf server ($jamf_host). Migration requires an active internet connection. Please ensure you have an active and stable internet conenction /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+      err "check_jamf_connectivity" "No connectivity to your Jamf server ($jamf_host). Migration requires an active internet connection. Please ensure you have an active and stable internet conenction \n\n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in \n\n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
   else
     success "Jamf connectivity check passed. ($jamf_host is reachable)"
   fi
@@ -282,7 +282,7 @@ check_device_power_type() {
   log "Checking power source..."
   if ! pmset -g batt | grep -q "AC Power";
   then
-      err "check_device_power_type" "Device is not connected to AC power. Please connect your power adapter to continue. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+      err "check_device_power_type" "Device is not connected to AC power. Please connect your power adapter to continue. \n\n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in \n\n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
   else
     success "Device is connected to AC power."
   fi
@@ -293,7 +293,7 @@ check_device_power_type() {
 check_mdm_profile() {
   log "Checking for active MDM profile..."
   if ! profiles status -type enrollment | grep -q "Enrolled via DEP:"; then
-      err "check_mdm_profile" "No active MDM profile was detected. This device must be enrolled in MDM to proceed. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+      err "check_mdm_profile" "No active MDM profile was detected. This device must be enrolled in MDM to proceed. \n\n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in \n\n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
   else
     success "Active MDM profile detected."
   fi
@@ -305,14 +305,14 @@ check_jamf_enrollment() {
   log "Verifying current Jamf Pro enrollment status..."
   if [[ ! -f "/usr/local/jamf/bin/jamf" ]];
   then
-      err "check_jamf_enrollment" "Jamf binary not found - device not enrolled in any Jamf Pro instance. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+      err "check_jamf_enrollment" "Jamf binary not found - device not enrolled in any Jamf Pro instance. \n\n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in \n\n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
   else
     local current_jss_url
     current_jss_url=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)
     
     if [[ "$current_jss_url" == "$target_jamf_url"* ]];
     then
-      err "check_jamf_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+      err "check_jamf_enrollment" "Device is already enrolled in the target Jamf Pro instance. Migration unnecessary. \n\n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in \n\n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
     elif [[ "$current_jss_url" != "$origin_jamf_url"* ]]; then
       log "WARN: Device is enrolled in neither the origin nor target Jamf instance. Current: $current_jss_url"
     else
@@ -329,7 +329,7 @@ check_apns_connectivity() {
   then
     success "APNs hostname (api.push.apple.com) is reachable on port 443."
   else
-      err "check_apns_connectivity" "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+      err "check_apns_connectivity" "Cannot reach APNs. This may be due to network restrictions or a firewall. Migration will likely fail. \n\n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in \n\n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
   fi
 }
 
@@ -407,7 +407,7 @@ get_computer_inventory_id() {
 
     if [[ "$http_status" -ne 200 ]];
     then
-        err "get_computer_inventory_id" "Jamf API request failed with HTTP status $http_status. /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+        err "get_computer_inventory_id" "Jamf API request failed with HTTP status $http_status. \n\n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in \n\n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
     fi
 
     computer_id=$(echo "$response_body" | jq -r '.results[0].id')
@@ -458,8 +458,7 @@ trigger_remote_wipe() {
 
     response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
      "$origin_jamf_url/api/v2/mdm/commands" \
- 
-           -H "Authorization: Bearer $bearer_token" \
+        -H "Authorization: Bearer $bearer_token" \
         -H "Content-Type: application/json" \
         -d "$payload")
 
@@ -468,11 +467,10 @@ trigger_remote_wipe() {
     if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]];
     then
         success "EraseDevice command sent successfully (HTTP $http_status)."
-        # Deferral reset lines have been removed.
         show_dialog_info "Wipe Command Sent" "The remote wipe command has been sent to this Mac. It will restart and erase itself shortly."
         exit 0
     else
-        err "trigger_remote_wipe" "Failed to send EraseDevice command. HTTP status: $http_status /n/n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in /n/n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
+        err "trigger_remote_wipe" "Failed to send EraseDevice command. HTTP status: $http_status \n\n To try again please search for 'Migrate to LBG Business' in Self Service, or wait for your next device check-in \n\n If trying agian does not work, please submit a Mac Fault via IT@LBG for assistance."
     fi
 }
 
