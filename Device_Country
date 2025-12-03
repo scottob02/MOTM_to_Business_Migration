@@ -1,67 +1,19 @@
 #!/bin/zsh
 
 # -------------------------------------------------------------------------
-# Jamf Pro Extension Attribute: Physical Country Location
-# Purpose: Retrieves Country Code and Name based on Public IP (e.g., "UK (United Kingdom)")
+# Jamf Pro Extension Attribute: Wi-Fi Country Code
+# Purpose: Retrieves the Country Code broadcast by the connected Wi-Fi router.
 # -------------------------------------------------------------------------
 
-# API Endpoint
-# We use ipapi.co because it supports HTTPS and JSON output.
-# If you have a paid API key, append it here (e.g., https://ipapi.co/json?key=YOUR_KEY)
-API_URL="https://ipapi.co/json"
+# Get the Country Code from system_profiler
+# This looks for the "Country Code:" line in the AirPort data.
+wifi_country=$(system_profiler SPAirPortDataType 2>/dev/null | awk '/Country Code:/ {print $3}' | head -1)
 
-# Timeout in seconds to prevent the script from hanging if the API is unreachable
-TIMEOUT=5
-
-# -------------------------------------------------------------------------
-# Execution
-# -------------------------------------------------------------------------
-
-# 1. Fetch Location Data
-# We use curl with a max-time to ensure the script doesn't stall the Jamf recon process.
-# -s: Silent mode
-response=$(curl -s --max-time "$TIMEOUT" "$API_URL")
-
-# 2. Validate Response
-# Check if curl failed or if we got an empty response
-if [[ -z "$response" ]]; then
-    echo "<result>Offline or Unreachable</result>"
-    exit 0
-fi
-
-# 3. Parse JSON using osascript (JXA)
-# We use JXA (JavaScript for Automation) because it is native to macOS 
-# and handles JSON reliably without needing 'jq' installed.
-
-country_code=$(echo "$response" | osascript -l "JavaScript" -e '
-    function run(argv) {
-        try {
-            var json = JSON.parse(argv[0]);
-            return json.country_code || "Unknown";
-        } catch (e) {
-            return "Error";
-        }
-    }' -- -)
-
-country_name=$(echo "$response" | osascript -l "JavaScript" -e '
-    function run(argv) {
-        try {
-            var json = JSON.parse(argv[0]);
-            return json.country_name || "Unknown";
-        } catch (e) {
-            return "Error";
-        }
-    }' -- -)
-
-# 4. Format Output
-# Desired format: "CODE (Name)", e.g., "GB (United Kingdom)"
-
-if [[ "$country_code" == "Error" ]] || [[ "$country_code" == "Unknown" ]]; then
-    # Fallback if the API returns an error message (e.g., rate limit exceeded)
-    echo "<result>Lookup Failed</result>"
+if [[ -n "$wifi_country" ]]; then
+    # Output format example: "DE", "GB", "US"
+    echo "<result>$wifi_country</result>"
 else
-    # Output the formatted result for Jamf
-    echo "<result>$country_code ($country_name)</result>"
+    echo "<result>Unknown (No Wi-Fi/Ethernet only)</result>"
 fi
 
 exit 0
