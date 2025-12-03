@@ -1,19 +1,40 @@
 #!/bin/zsh
 
 # -------------------------------------------------------------------------
-# Jamf Pro Extension Attribute: Wi-Fi Country Code
-# Purpose: Retrieves the Country Code broadcast by the connected Wi-Fi router.
+# Jamf Pro Extension Attribute: Wi-Fi Country Code (With Caching)
+# Purpose: Retrieves Wi-Fi Country Code. Falls back to last known code if Wi-Fi is off.
 # -------------------------------------------------------------------------
 
-# Get the Country Code from system_profiler
-# This looks for the "Country Code:" line in the AirPort data.
-wifi_country=$(system_profiler SPAirPortDataType 2>/dev/null | awk '/Country Code:/ {print $3}' | head -1)
+# Path to store the cached value
+CACHE_FILE="/Library/Application Support/Jamf/.last_known_country_code"
 
-if [[ -n "$wifi_country" ]]; then
-    # Output format example: "DE", "GB", "US"
-    echo "<result>$wifi_country</result>"
+# 1. Try to get the current Wi-Fi Country Code
+current_wifi_country=$(system_profiler SPAirPortDataType 2>/dev/null | awk '/Country Code:/ {print $3}' | head -1)
+
+# 2. Logic Check
+if [[ -n "$current_wifi_country" ]]; then
+    # SUCCESS: We found a live country code.
+    
+    # Save it to the cache file for future use (overwriting old data)
+    echo "$current_wifi_country" > "$CACHE_FILE"
+    
+    # Output the result for Jamf
+    echo "<result>$current_wifi_country</result>"
+
 else
-    echo "<result>Unknown (No Wi-Fi/Ethernet only)</result>"
+    # FAILURE: Wi-Fi is off or not connected.
+    
+    # Check if we have a saved file from the past
+    if [[ -f "$CACHE_FILE" ]]; then
+        # Read the cached value
+        cached_country=$(cat "$CACHE_FILE")
+        
+        # Output the cached result with a flag so you know it's old data
+        echo "<result>$cached_country (Last Known)</result>"
+    else
+        # No live data AND no cache file exists (never ran successfully before)
+        echo "<result>Unknown</result>"
+    fi
 fi
 
 exit 0
