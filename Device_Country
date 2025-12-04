@@ -1,57 +1,81 @@
 #!/bin/bash
 
 # ==============================================================================
-# SCRIPT: Get Country Code with Fail-Over Persistence
-# PURPOSE: Retrieves the ISO country code (e.g., US, GB, IN) based on IP.
-#          Stores the value locally to ensure a result is returned even if offline.
+# SCRIPT: Get Country Code with Dual-API Fail-Over & Persistence
+# PURPOSE: Retrieves ISO country code using two different providers to reduce failures.
+#          1. Tries ipapi.co
+#          2. If that fails, tries ipinfo.io
+#          3. If both fail, uses last known cached value.
 # ==============================================================================
 
-# 1. Configuration Variables
+# 1. Configuration
 # ------------------------------------------------------------------------------
-# We use a hidden file in a shared location so it persists across reboots/users.
 CACHE_FILE="/Library/Application Support/Jamf/addons/org_location_country.txt"
 CACHE_DIR=$(dirname "$CACHE_FILE")
 
-# The API endpoint. 
-# ipapi.co/country is reliable and returns a simple 2-letter text string (e.g., "GB")
-# Alternatives if blocked: "https://ipinfo.io/country" or "https://ifconfig.co/country-iso"
-API_URL="https://ipapi.co/country/"
+# Primary API (ipapi)
+PRIMARY_URL="https://ipapi.co/country/"
 
-# 2. Function to Ensure Cache Directory Exists
+# Secondary API (ipinfo) - Used if Primary fails
+# We use this instead of ifconfig.me because we need the Country Code, not the IP.
+SECONDARY_URL="https://ipinfo.io/country"
+
+# 2. Setup Cache Directory
 # ------------------------------------------------------------------------------
 if [[ ! -d "$CACHE_DIR" ]]; then
     mkdir -p "$CACHE_DIR"
 fi
 
-# 3. Attempt to fetch current location
+# 3. Fetch Data Function
 # ------------------------------------------------------------------------------
-# We use curl with a max time (-m) of 5 seconds so the script doesn't hang forever.
-# -s = silent (no progress bar), -f = fail silently on server errors
-CURRENT_CODE=$(curl -s -f -m 5 "$API_URL")
+# We use a function to handle the validation logic easily for both URLs
+get_country_code() {
+    local url="$1"
+    # -s: Silent, -f: Fail fast on server error, -m 3: Max 3 seconds wait
+    local result
+    result=$(curl -s -f -m 3 "$url" | tr -d '[:space:]') 
+    
+    # Validation: Check if result is exactly 2 characters (e.g., US, GB, IN)
+    if [[ -n "$result" && ${#result} -eq 2 ]]; then
+        echo "$result"
+        return 0
+    else
+        return 1
+    fi
+}
 
-# 4. Validate and Process Result
+# 4. Execution Logic
 # ------------------------------------------------------------------------------
-# Check if we got a valid response (Not empty, and usually 2 chars like 'US' or 'GB')
-if [[ -n "$CURRENT_CODE" && ${#CURRENT_CODE} -eq 2 ]]; then
-    # --- SUCCESS CASE ---
-    # We got a valid code. Update the cache file.
-    echo "$CURRENT_CODE" > "$CACHE_FILE"
-    RESULT="$CURRENT_CODE"
+
+# Attempt 1: Primary URL
+NEW_CODE=$(get_country_code "$PRIMARY_URL")
+
+# Attempt 2: Secondary URL (Run only if Primary returned empty)
+if [[ -z "$NEW_CODE" ]]; then
+    NEW_CODE=$(get_country_code "$SECONDARY_URL")
+fi
+
+# 5. Final Processing
+# ------------------------------------------------------------------------------
+
+if [[ -n "$NEW_CODE" ]]; then
+    # --- SUCCESS ---
+    # We got a valid code from either Primary or Secondary. 
+    # Update the cache and set the result.
+    echo "$NEW_CODE" > "$CACHE_FILE"
+    RESULT="$NEW_CODE"
 
 else
-    # --- FAILURE CASE ---
-    # The API failed. Check if we have a previously saved value.
+    # --- TOTAL FAILURE ---
+    # Both APIs failed (likely no internet or strict firewall).
+    # Check for a cached value.
     if [[ -f "$CACHE_FILE" ]]; then
-        CACHED_VAL=$(cat "$CACHE_FILE")
-        # Optional: You can append " (Cached)" if you want to know it's old data,
-        # but for pure grouping logic, it's usually better to keep it clean.
-        RESULT="$CACHED_VAL"
+        RESULT=$(cat "$CACHE_FILE")
     else
-        # No API access and no previous cache.
         RESULT="Unknown"
     fi
 fi
 
-# 5. Output to Jamf
+# 6. Output to Jamf
 # ------------------------------------------------------------------------------
 echo "<result>$RESULT</result>"
