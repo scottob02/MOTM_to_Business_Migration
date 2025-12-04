@@ -1,40 +1,57 @@
-#!/bin/zsh
+#!/bin/bash
 
-# -------------------------------------------------------------------------
-# Jamf Pro Extension Attribute: Wi-Fi Country Code (With Caching)
-# Purpose: Retrieves Wi-Fi Country Code. Falls back to last known code if Wi-Fi is off.
-# -------------------------------------------------------------------------
+# ==============================================================================
+# SCRIPT: Get Country Code with Fail-Over Persistence
+# PURPOSE: Retrieves the ISO country code (e.g., US, GB, IN) based on IP.
+#          Stores the value locally to ensure a result is returned even if offline.
+# ==============================================================================
 
-# Path to store the cached value
-CACHE_FILE="/Library/Application Support/Jamf/.last_known_country_code"
+# 1. Configuration Variables
+# ------------------------------------------------------------------------------
+# We use a hidden file in a shared location so it persists across reboots/users.
+CACHE_FILE="/Library/Application Support/Jamf/addons/org_location_country.txt"
+CACHE_DIR=$(dirname "$CACHE_FILE")
 
-# 1. Try to get the current Wi-Fi Country Code
-current_wifi_country=$(system_profiler SPAirPortDataType 2>/dev/null | awk '/Country Code:/ {print $3}' | head -1)
+# The API endpoint. 
+# ipapi.co/country is reliable and returns a simple 2-letter text string (e.g., "GB")
+# Alternatives if blocked: "https://ipinfo.io/country" or "https://ifconfig.co/country-iso"
+API_URL="https://ipapi.co/country/"
 
-# 2. Logic Check
-if [[ -n "$current_wifi_country" ]]; then
-    # SUCCESS: We found a live country code.
-    
-    # Save it to the cache file for future use (overwriting old data)
-    echo "$current_wifi_country" > "$CACHE_FILE"
-    
-    # Output the result for Jamf
-    echo "<result>$current_wifi_country</result>"
+# 2. Function to Ensure Cache Directory Exists
+# ------------------------------------------------------------------------------
+if [[ ! -d "$CACHE_DIR" ]]; then
+    mkdir -p "$CACHE_DIR"
+fi
+
+# 3. Attempt to fetch current location
+# ------------------------------------------------------------------------------
+# We use curl with a max time (-m) of 5 seconds so the script doesn't hang forever.
+# -s = silent (no progress bar), -f = fail silently on server errors
+CURRENT_CODE=$(curl -s -f -m 5 "$API_URL")
+
+# 4. Validate and Process Result
+# ------------------------------------------------------------------------------
+# Check if we got a valid response (Not empty, and usually 2 chars like 'US' or 'GB')
+if [[ -n "$CURRENT_CODE" && ${#CURRENT_CODE} -eq 2 ]]; then
+    # --- SUCCESS CASE ---
+    # We got a valid code. Update the cache file.
+    echo "$CURRENT_CODE" > "$CACHE_FILE"
+    RESULT="$CURRENT_CODE"
 
 else
-    # FAILURE: Wi-Fi is off or not connected.
-    
-    # Check if we have a saved file from the past
+    # --- FAILURE CASE ---
+    # The API failed. Check if we have a previously saved value.
     if [[ -f "$CACHE_FILE" ]]; then
-        # Read the cached value
-        cached_country=$(cat "$CACHE_FILE")
-        
-        # Output the cached result with a flag so you know it's old data
-        echo "<result>$cached_country (Last Known)</result>"
+        CACHED_VAL=$(cat "$CACHE_FILE")
+        # Optional: You can append " (Cached)" if you want to know it's old data,
+        # but for pure grouping logic, it's usually better to keep it clean.
+        RESULT="$CACHED_VAL"
     else
-        # No live data AND no cache file exists (never ran successfully before)
-        echo "<result>Unknown</result>"
+        # No API access and no previous cache.
+        RESULT="Unknown"
     fi
 fi
 
-exit 0
+# 5. Output to Jamf
+# ------------------------------------------------------------------------------
+echo "<result>$RESULT</result>"
