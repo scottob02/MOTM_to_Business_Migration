@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # ==============================================================================
-# SCRIPT: Get Country Code with Dual-API Fail-Over & Persistence
-# PURPOSE: Retrieves ISO country code using two different providers to reduce failures.
-#          1. Tries ipapi.co
-#          2. If that fails, tries ipinfo.io
-#          3. If both fail, uses last known cached value.
+# SCRIPT: Get Country Code (Dual Redundancy)
+# PURPOSE: Retrieves ISO country code (e.g., GB, IN).
+#          1. Tries ipinfo.io (Primary)
+#          2. Tries ifconfig.co (Fail-over)
+#          3. Falls back to local cache if both fail.
 # ==============================================================================
 
 # 1. Configuration
@@ -13,69 +13,57 @@
 CACHE_FILE="/Library/Application Support/Jamf/addons/org_location_country.txt"
 CACHE_DIR=$(dirname "$CACHE_FILE")
 
-# Primary API (ipapi)
-PRIMARY_URL="https://ipapi.co/country/"
-
-# Secondary API (ipinfo) - Used if Primary fails
-# We use this instead of ifconfig.me because we need the Country Code, not the IP.
-SECONDARY_URL="https://ipinfo.io/country"
+# List of verified, working URLs.
+# The script will try them in this specific order.
+URL_LIST=(
+    "https://ipinfo.io/country"
+    "https://ifconfig.co/country-iso"
+)
 
 # 2. Setup Cache Directory
 # ------------------------------------------------------------------------------
+# Ensure the directory exists so we can save the file later.
 if [[ ! -d "$CACHE_DIR" ]]; then
     mkdir -p "$CACHE_DIR"
 fi
 
-# 3. Fetch Data Function
+# 3. Fetch Logic
 # ------------------------------------------------------------------------------
-# We use a function to handle the validation logic easily for both URLs
-get_country_code() {
-    local url="$1"
-    # -s: Silent, -f: Fail fast on server error, -m 3: Max 3 seconds wait
-    local result
-    result=$(curl -s -f -m 3 "$url" | tr -d '[:space:]') 
+NEW_CODE=""
+
+# Loop through the URLs
+for url in "${URL_LIST[@]}"; do
+    # -s: Silent (no progress bar)
+    # -m 3: Max time 3 seconds per attempt
+    # tr -d '[:space:]': Removes any hidden newlines/spaces
+    result=$(curl -s -m 3 "$url" | tr -d '[:space:]')
     
-    # Validation: Check if result is exactly 2 characters (e.g., US, GB, IN)
+    # Validation: We only accept a result if it is exactly 2 characters long (e.g. "US")
     if [[ -n "$result" && ${#result} -eq 2 ]]; then
-        echo "$result"
-        return 0
-    else
-        return 1
+        NEW_CODE="$result"
+        break # We found a working one, exit the loop
     fi
-}
+done
 
-# 4. Execution Logic
+# 4. Final Processing & Persistence
 # ------------------------------------------------------------------------------
-
-# Attempt 1: Primary URL
-NEW_CODE=$(get_country_code "$PRIMARY_URL")
-
-# Attempt 2: Secondary URL (Run only if Primary returned empty)
-if [[ -z "$NEW_CODE" ]]; then
-    NEW_CODE=$(get_country_code "$SECONDARY_URL")
-fi
-
-# 5. Final Processing
-# ------------------------------------------------------------------------------
-
 if [[ -n "$NEW_CODE" ]]; then
     # --- SUCCESS ---
-    # We got a valid code from either Primary or Secondary. 
-    # Update the cache and set the result.
+    # We got a live result. Update the cache file and set the variable.
     echo "$NEW_CODE" > "$CACHE_FILE"
     RESULT="$NEW_CODE"
 
 else
-    # --- TOTAL FAILURE ---
-    # Both APIs failed (likely no internet or strict firewall).
-    # Check for a cached value.
+    # --- FAILURE ---
+    # Both URLs failed. Read from the cache file if it exists.
     if [[ -f "$CACHE_FILE" ]]; then
         RESULT=$(cat "$CACHE_FILE")
     else
+        # No internet and no previous history.
         RESULT="Unknown"
     fi
 fi
 
-# 6. Output to Jamf
+# 5. Output to Jamf
 # ------------------------------------------------------------------------------
 echo "<result>$RESULT</result>"
